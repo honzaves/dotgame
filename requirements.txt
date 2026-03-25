@@ -1,0 +1,7 @@
+# Dot Grid — Python dependencies
+# Required
+pygame>=2.1.0
+numpy>=1.24.0
+
+# Optional — enables PyTorch Net and Neural MCTS AI modes
+# torch>=2.0.0

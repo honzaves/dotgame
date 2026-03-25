@@ -633,6 +633,18 @@ same as `PyTorchPlayer`.
 
 ---
 
+## Project files
+
+| File | Purpose |
+|---|---|
+| `pyproject.toml` | Project metadata, entry point, optional `[torch]` dependency group |
+| `requirements.txt` | Plain pip requirements (pygame + numpy; torch commented out) |
+| `CLAUDE.md` | This file — AI/contributor context |
+| `README.md` | User-facing docs |
+| `HOW_THE_AI_WORKS.md` | Plain-English AI guide |
+
+---
+
 ## Adding a new game mode
 
 1. Add `Mode` variant to enum in `game_mode.py`.

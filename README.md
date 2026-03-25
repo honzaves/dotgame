@@ -7,12 +7,23 @@ outsmart your opponent — or train an AI to do it for you.
 
 ## Requirements
 
+Python 3.10 or later required.
+
+**Quick install:**
+
 ```bash
 pip install pygame numpy          # required
 pip install torch                 # optional — enables PyTorch AI modes
 ```
 
-Python 3.10 or later required.
+**Or install from the project file (includes optional groups):**
+
+```bash
+pip install -e .                  # required deps only
+pip install -e ".[torch]"         # required + PyTorch AI modes
+```
+
+A plain `requirements.txt` is also provided for environments that prefer it.
 
 ---
 
