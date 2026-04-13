@@ -193,9 +193,10 @@ class NeuralMCTSPlayer(BasePlayer):
         # 2.5-point square opportunity (1/100 × 1024 > 1 × 4).
         # Also suppresses dead spots — positions with zero immediate or ring
         # potential — but only once productive moves exist on the board.
+        game_phase = len(board) / max(n * n, 1)
         root_priors = self._tactical_priors(
             root_priors, board, connections, player, legal_mask,
-            suppress_dead=True)
+            suppress_dead=True, game_phase=game_phase)
 
         # ── Dirichlet noise for exploration ───────────────────────────────────
         # Prevents deterministic play and ensures diversity in training data.
@@ -299,9 +300,8 @@ class NeuralMCTSPlayer(BasePlayer):
 
         returns_np = advantages + np.array(vals, dtype=np.float32)
 
-        adv_std = advantages.std()
-        if adv_std > 1e-8:
-            advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)  # noqa (unused after this)
+        # returns_np is already computed; advantages are not used further in NM
+        # (there is no PPO ratio — policy is trained on CE against visit dist).
 
         # ── Build tensors ─────────────────────────────────────────────────────
         states_t  = torch.tensor(
@@ -338,11 +338,12 @@ class NeuralMCTSPlayer(BasePlayer):
         # MSE: teach the network to predict what the return will be
         val_loss = F.mse_loss(vals_pred, ret_t)
 
-        # Entropy bonus: keep exploration alive, especially early in training.
-        # Same 0 * -inf = nan hazard as pol_loss: illegal positions have
-        # probs=0 and log_probs=-inf. Use safe_log_probs (zeroed at illegal
-        # positions) so the product is always 0 * 0 = 0 there.
-        entropy  = -(probs * safe_log_probs).sum(dim=1).mean()
+        # Entropy over legal positions only.  Illegal positions already have
+        # probs=0 from the masked softmax, but we zero log_probs there too
+        # so the product is 0*0=0 (not 0*(-inf)=nan) and the gradient for
+        # near-zero-probability LEGAL moves is never accidentally suppressed.
+        legal_log_p = torch.where(masks_t, log_probs, torch.zeros_like(log_probs))
+        entropy     = -(probs * legal_log_p).sum(dim=1).mean()
 
         loss = (S.NM_POLICY_COEF  * pol_loss
                 + S.NM_VALUE_COEF * val_loss
@@ -374,10 +375,7 @@ class NeuralMCTSPlayer(BasePlayer):
 
             obs_returns = obs_advantages + np.array(obs_vals, dtype=np.float32)
 
-            obs_adv_std = obs_advantages.std()
-            if obs_adv_std > 1e-8:
-                obs_advantages = ((obs_advantages - obs_advantages.mean())
-                                  / (obs_adv_std + 1e-8))
+            # obs_advantages not used further; obs_returns feeds the value loss.
 
             obs_states_t = torch.tensor(
                 np.stack([t[0] for t in self._obs_episode]),
@@ -400,9 +398,11 @@ class NeuralMCTSPlayer(BasePlayer):
             obs_safe_lp = obs_log_probs.clone()
             obs_safe_lp[~obs_masks_t] = 0.0
 
-            obs_pol_loss = -(obs_pi_t * obs_safe_lp).sum(dim=1).mean()
-            obs_val_loss = F.mse_loss(obs_vals_pred, obs_ret_t)
-            obs_entropy  = -(obs_probs * obs_safe_lp).sum(dim=1).mean()
+            obs_pol_loss  = -(obs_pi_t * obs_safe_lp).sum(dim=1).mean()
+            obs_val_loss  = F.mse_loss(obs_vals_pred, obs_ret_t)
+            obs_legal_lp  = torch.where(obs_masks_t, obs_log_probs,
+                                        torch.zeros_like(obs_log_probs))
+            obs_entropy   = -(obs_probs * obs_legal_lp).sum(dim=1).mean()
 
             obs_loss = (S.NM_POLICY_COEF   * obs_pol_loss
                         + S.NM_VALUE_COEF  * obs_val_loss
@@ -528,9 +528,10 @@ class NeuralMCTSPlayer(BasePlayer):
         # moves over obvious immediate scores deep in the search.
         # Skip dead-spot suppression here for speed (arc_potential_map is O(G²)).
         legal_mask_np = mask.cpu().numpy()
+        node_phase = len(fb.board) / max(n * n, 1)
         priors = self._tactical_priors(
             priors, fb.board, fb.connections, fb.player, legal_mask_np,
-            suppress_dead=False)
+            suppress_dead=False, game_phase=node_phase)
 
         node.children = [
             _NMNode(move=(gx, gy), parent=node, children=None,
@@ -548,20 +549,23 @@ class NeuralMCTSPlayer(BasePlayer):
         player: int,
         legal_mask: np.ndarray,
         suppress_dead: bool = True,
+        game_phase: float = 0.0,
     ) -> np.ndarray:
         """Tactically-corrected priors for MCTS nodes.
 
         Two improvements over the old linear apply_boost():
 
-        1. Exponential scoring boost
+        1. Exponential scoring boost (phase-decayed)
            Old formula:  1 + (base−1) × score   (linear)
              score=0.5 → 2.5×,  score=2.5 → 8.5×
-           New formula:  exp(2·ln(base) × score) = base^(2×score)
-             score=0.5 → base^1 ≈  4×
-             score=1.0 → base^2 ≈ 16×
-             score=2.5 → base^5 ≈ 1024×
+           New formula:  exp(2·ln(base) × score × decay) = base^(2×score×decay)
+             score=0.5 → base^1 ≈  4×  (at game_phase=0)
+             score=1.0 → base^2 ≈ 16×  (at game_phase=0)
+             score=2.5 → base^5 ≈ 1024× (at game_phase=0)
            A network prior 100× biased toward a 0.5-pt triangle cannot beat
            a 2.5-pt square: (1/100)×1024 = 10.2  vs  1.0×4 = 4.
+           By game_phase=1.0, decay=0.3, so boost is 30% of maximum —
+           a well-trained network can override it with a ring strategy.
 
         2. Dead-spot suppression (suppress_dead=True, root only)
            Positions with zero immediate scoring value AND zero ring-arc
@@ -575,8 +579,11 @@ class NeuralMCTSPlayer(BasePlayer):
         own_leg  = own_s.astype(np.float64) * legal_mask
         opp_leg  = opp_s.astype(np.float64) * legal_mask
 
-        close_k = 2.0 * math.log(max(S.AI_CLOSE_BOOST, 2.0))
-        block_k = 2.0 * math.log(max(S.AI_BLOCK_BOOST, 2.0))
+        # Decay tactical boost with game phase so a trained network can
+        # override it late-game. Floor of 0.3 keeps a safety net alive.
+        phase_decay = max(0.3, 1.0 - game_phase)
+        close_k = 2.0 * math.log(max(S.AI_CLOSE_BOOST, 2.0)) * phase_decay
+        block_k = 2.0 * math.log(max(S.AI_BLOCK_BOOST, 2.0)) * phase_decay
 
         if own_leg.any():
             p *= np.exp(close_k * own_leg)

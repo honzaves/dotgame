@@ -31,7 +31,7 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import (opportunity_masks, apply_boost, enclosure_potential,
+from ai.features import (opportunity_masks, apply_boost, arc_potential_map,
                           strategic_channels)
 
 # Adam hyper-parameters
@@ -200,9 +200,10 @@ class _ACNetwork:
             arrays[f'm_{name}'] = p.m
             arrays[f'v_{name}'] = p.v
         arrays['adam_t'] = np.array([self._t])
-        arrays['meta_grid']     = np.array([grid])
-        arrays['meta_hidden']   = np.array(hidden or [])
-        arrays['meta_channels'] = np.array([15])
+        arrays['meta_grid']        = np.array([grid])
+        arrays['meta_hidden']      = np.array(hidden or [])
+        arrays['meta_channels']    = np.array([15])
+        arrays['meta_enc_version'] = np.array([2])   # 2 = arc_potential (not enclosure)
         np.savez(path, **arrays)
 
     def load(self, path: str, grid: int = 0, hidden: list = None) -> None:
@@ -211,9 +212,11 @@ class _ACNetwork:
         if 'meta_grid' in data:
             saved_grid     = int(data['meta_grid'][0])
             saved_hidden   = list(data['meta_hidden'].astype(int))
-            saved_channels = int(data['meta_channels'][0]) if 'meta_channels' in data else 7
-            if saved_grid != grid or saved_hidden != (hidden or []) or saved_channels != 15:
-                return   # incompatible architecture — start fresh   # silently ignore incompatible checkpoint
+            saved_channels  = int(data['meta_channels'][0])    if 'meta_channels'    in data else 7
+            saved_enc_ver   = int(data['meta_enc_version'][0]) if 'meta_enc_version' in data else 1
+            if (saved_grid != grid or saved_hidden != (hidden or [])
+                    or saved_channels != 15 or saved_enc_ver != 2):
+                return   # incompatible architecture or encoding — start fresh
         if 'adam_t' in data:
             self._t = int(data['adam_t'][0])
         for i, (pw, pb) in enumerate(zip(self._trunk_w, self._trunk_b)):
@@ -244,8 +247,8 @@ def encode_state(board: dict, connections: set,
     Channel 4 : opponent connection mask
     Channel  5 : own closing score / 4.0
     Channel  6 : opponent threat score / 4.0
-    Channel  7 : own enclosure potential
-    Channel  8 : opponent enclosure potential
+    Channel  7 : own arc potential (ring-building progress, continuous)
+    Channel  8 : opponent arc potential
     Channel  9 : own bridge potential  (extra from joining two arcs)
     Channel 10 : opp bridge potential
     Channel 11 : disruption map        (how much placing here hurts opp ring)
@@ -279,9 +282,13 @@ def encode_state(board: dict, connections: set,
     out[5*n*n : 6*n*n] = (own_scores / 4.0).clip(0.0, 1.0).astype(np.float32)
     out[6*n*n : 7*n*n] = (opp_scores / 4.0).clip(0.0, 1.0).astype(np.float32)
 
-    own_enc, opp_enc = enclosure_potential(board, connections, player)
-    out[7*n*n : 8*n*n] = own_enc.clip(0.0, 1.0)
-    out[8*n*n : 9*n*n] = opp_enc.clip(0.0, 1.0)
+    # Arc potential: continuous ring-building signal (non-zero throughout ring
+    # construction, unlike enclosure_potential which returns 0 until ring closes).
+    # Raw values are in territory-cell units; normalise by (n-1)² → [0, 1].
+    n_cells = float(max((n - 1) ** 2, 1))
+    own_arc, opp_arc = arc_potential_map(board, player)
+    out[7*n*n : 8*n*n] = (own_arc / n_cells).clip(0.0, 1.0).astype(np.float32)
+    out[8*n*n : 9*n*n] = (opp_arc / n_cells).clip(0.0, 1.0).astype(np.float32)
 
     own_br, opp_br, disrupt, fork, phase_arr, cent = strategic_channels(
         board, connections, player, total_dots=len(board))
@@ -384,9 +391,7 @@ class NNPlayer(BasePlayer):
 
             returns = advantages + np.array(vals, dtype=np.float64)
 
-            adv_std = advantages.std()
-            if adv_std > 1e-8:
-                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             for t, (enc, action, acts, val) in enumerate(self._traj):
                 self._net.update(
@@ -416,9 +421,7 @@ class NNPlayer(BasePlayer):
 
             obs_returns = obs_adv + np.array(obs_vals, dtype=np.float64)
 
-            obs_adv_std = obs_adv.std()
-            if obs_adv_std > 1e-8:
-                obs_adv = (obs_adv - obs_adv.mean()) / (obs_adv_std + 1e-8)
+            obs_adv = (obs_adv - obs_adv.mean()) / (obs_adv.std() + 1e-8)
 
             for t, (enc, action, acts, val) in enumerate(self._obs_traj):
                 self._net.update(

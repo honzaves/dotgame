@@ -665,6 +665,17 @@ class MCTSPlayer(BasePlayer):
             outcome = (1.0  if winner == self.player_id else
                        0.0  if winner != 0              else 0.5)
 
+        # Blend in intermediate shaping rewards (territory-delta + arc-delta).
+        # Scales them to [0,1] and mixes 20% shaped signal into the outcome so
+        # MCTS experience learns that ring-building paths lead to wins.
+        if intermediate_rewards:
+            n_moves = max(len(intermediate_rewards), 1)
+            shaped_sum = float(np.sum(intermediate_rewards))
+            max_shape = n_moves * 0.25
+            shaped01 = float(np.clip(
+                0.5 + shaped_sum / max(max_shape * 2.0, 1e-8), 0.0, 1.0))
+            outcome = float(np.clip(0.80 * outcome + 0.20 * shaped01, 0.0, 1.0))
+
         # Own moves AND observed opponent-move positions are both positions
         # we occupied during the game.  Both get the same outcome from our
         # perspective: good positions (that led to wins) get outcome→1,

@@ -25,7 +25,7 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import (opportunity_masks, apply_boost, enclosure_potential,
+from ai.features import (opportunity_masks, apply_boost, arc_potential_map,
                           strategic_channels)
 
 _TORCH_AVAILABLE = False
@@ -80,9 +80,11 @@ def encode_state(board: dict, connections: set,
     out[5] = (own_scores / 4.0).clip(0.0, 1.0).reshape(n, n).astype(np.float32)
     out[6] = (opp_scores / 4.0).clip(0.0, 1.0).reshape(n, n).astype(np.float32)
 
-    own_enc, opp_enc = enclosure_potential(board, connections, player)
-    out[7] = own_enc.clip(0.0, 1.0).reshape(n, n)
-    out[8] = opp_enc.clip(0.0, 1.0).reshape(n, n)
+    # Arc potential: continuous ring-building signal, normalised to [0, 1].
+    n_cells = float(max((n - 1) ** 2, 1))
+    own_arc, opp_arc = arc_potential_map(board, player)
+    out[7] = (own_arc / n_cells).clip(0.0, 1.0).reshape(n, n).astype(np.float32)
+    out[8] = (opp_arc / n_cells).clip(0.0, 1.0).reshape(n, n).astype(np.float32)
 
     own_br, opp_br, disrupt, fork, phase_arr, cent = strategic_channels(
         board, connections, player, total_dots=len(board))
@@ -262,9 +264,7 @@ class PyTorchPlayer(BasePlayer):
 
             returns_np = advantages + np.array(vals, dtype=np.float32)
 
-            adv_std = advantages.std()
-            if adv_std > 1e-8:
-                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             n = S.GRID
             states_t  = torch.tensor(
@@ -352,9 +352,7 @@ class PyTorchPlayer(BasePlayer):
 
             obs_ret = obs_adv + np.array(obs_vals, dtype=np.float32)
 
-            obs_adv_std = obs_adv.std()
-            if obs_adv_std > 1e-8:
-                obs_adv = (obs_adv - obs_adv.mean()) / (obs_adv_std + 1e-8)
+            obs_adv = (obs_adv - obs_adv.mean()) / (obs_adv.std() + 1e-8)
 
             n = S.GRID
             obs_states_t  = torch.tensor(
@@ -374,47 +372,55 @@ class PyTorchPlayer(BasePlayer):
             obs_ret_t     = torch.tensor(obs_ret, dtype=torch.float32,
                                          device=self._device)
 
-            # One PPO pass over observed data
-            idx_obs  = np.arange(T_obs)
-            mb_obs   = min(S.PT_PPO_MINIBATCH, T_obs)
-            clip     = S.PT_PPO_CLIP
-            np.random.shuffle(idx_obs)
-            for start in range(0, T_obs, mb_obs):
-                batch = idx_obs[start:start + mb_obs]
-                if len(batch) == 0:
-                    continue
+            # Half as many epochs as own moves — opponent observations are
+            # supervised signal from actual play, not self-bootstrapped,
+            # so they're valuable but noisier than own-move advantages.
+            # Half as many epochs as own moves — opponent observations are
+            # supervised signal from actual play, not self-bootstrapped,
+            # so they're valuable but train with less PPO repetition.
+            obs_epochs = max(1, S.PT_PPO_EPOCHS // 2)
+            idx_obs    = np.arange(T_obs)
+            mb_obs     = min(S.PT_PPO_MINIBATCH, T_obs)
+            clip       = S.PT_PPO_CLIP
 
-                b_states  = obs_states_t[batch]
-                b_masks   = obs_masks_t[batch]
-                b_actions = obs_actions_t[batch]
-                b_lp_old  = obs_lp_old_t[batch]
-                b_adv     = obs_adv_t[batch]
-                b_ret     = obs_ret_t[batch]
+            for _ in range(obs_epochs):
+                np.random.shuffle(idx_obs)
+                for start in range(0, T_obs, mb_obs):
+                    batch = idx_obs[start:start + mb_obs]
+                    if len(batch) == 0:
+                        continue
 
-                logits, vals_pred = self._net(b_states)
-                logits = logits.clone()
-                logits[~b_masks] = float('-inf')
-                log_p_all = F.log_softmax(logits, dim=1)
-                log_p     = log_p_all.gather(
-                    1, b_actions.unsqueeze(1)).squeeze(1)
+                    b_states  = obs_states_t[batch]
+                    b_masks   = obs_masks_t[batch]
+                    b_actions = obs_actions_t[batch]
+                    b_lp_old  = obs_lp_old_t[batch]
+                    b_adv     = obs_adv_t[batch]
+                    b_ret     = obs_ret_t[batch]
 
-                ratio    = torch.exp(log_p - b_lp_old)
-                surr1    = ratio * b_adv
-                surr2    = torch.clamp(ratio, 1 - clip, 1 + clip) * b_adv
-                pol_loss = -torch.min(surr1, surr2).mean()
-                val_loss = F.mse_loss(vals_pred, b_ret)
-                probs_all = log_p_all.exp()
-                entropy   = -(probs_all * log_p_all).sum(dim=1).mean()
+                    logits, vals_pred = self._net(b_states)
+                    logits = logits.clone()
+                    logits[~b_masks] = float('-inf')
+                    log_p_all = F.log_softmax(logits, dim=1)
+                    log_p     = log_p_all.gather(
+                        1, b_actions.unsqueeze(1)).squeeze(1)
 
-                loss = (pol_loss
-                        + S.PT_VALUE_COEF   * val_loss
-                        - S.PT_ENTROPY_COEF * entropy)
+                    ratio    = torch.exp(log_p - b_lp_old)
+                    surr1    = ratio * b_adv
+                    surr2    = torch.clamp(ratio, 1 - clip, 1 + clip) * b_adv
+                    pol_loss = -torch.min(surr1, surr2).mean()
+                    val_loss = F.mse_loss(vals_pred, b_ret)
+                    probs_all = log_p_all.exp()
+                    entropy   = -(probs_all * log_p_all).sum(dim=1).mean()
 
-                self._opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self._net.parameters(), S.PT_MAX_GRAD_NORM)
-                self._opt.step()
+                    loss = (pol_loss
+                            + S.PT_VALUE_COEF   * val_loss
+                            - S.PT_ENTROPY_COEF * entropy)
+
+                    self._opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self._net.parameters(), S.PT_MAX_GRAD_NORM)
+                    self._opt.step()
 
             self._obs_traj.clear()
 
@@ -464,10 +470,11 @@ class PyTorchPlayer(BasePlayer):
         path = experience_path(S.PT_EXPERIENCE_BASE, '.pt')
         try:
             torch.save({
-                'model':  self._net.state_dict(),
-                'optim':  self._opt.state_dict(),
-                'grid':   S.GRID,
-                'arch':   self._arch,
+                'model':       self._net.state_dict(),
+                'optim':       self._opt.state_dict(),
+                'grid':        S.GRID,
+                'arch':        self._arch,
+                'enc_version': 2,   # 2 = arc_potential channels (not enclosure)
             }, path)
         except OSError:
             pass
@@ -480,7 +487,8 @@ class PyTorchPlayer(BasePlayer):
             ck = torch.load(path, map_location=self._device,
                             weights_only=False)
             if (ck.get('grid') == S.GRID
-                    and ck.get('arch') == self._arch):
+                    and ck.get('arch') == self._arch
+                    and ck.get('enc_version', 1) == 2):
                 self._net.load_state_dict(ck['model'])
                 self._opt.load_state_dict(ck['optim'])
         except Exception:

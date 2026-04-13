@@ -291,8 +291,9 @@ class Trainer:
                 arc_after, _ = arc_potential_scalars(dict(game.board), cp)
                 arc_delta    = max(0.0, arc_after - arc_before)
 
-                shaping = (terr_delta * S.REWARD_TERRITORY
-                           + arc_delta * S.REWARD_ARC_SHAPING)
+                shaping = max(-1.0, min(1.0,
+                    terr_delta * S.REWARD_TERRITORY
+                    + arc_delta * S.REWARD_ARC_SHAPING))
                 move_scores[cp].append(shaping)
 
                 # Symmetric learning: let the OTHER player observe this move

@@ -46,7 +46,7 @@ def _restore(snap: dict) -> None:
     game_over / winner_player — those stay as-is so the win screen
     remains visible during replay)."""
     global board, connections, territories, interior_dots, interior_conns
-    global scores, current_player, last_move, total_moves
+    global forbidden_positions, scores, current_player, last_move, total_moves
 
     board               = dict(snap['board'])
     connections         = set(snap['connections'])

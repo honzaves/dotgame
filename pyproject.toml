@@ -32,6 +32,10 @@ dot-grid = "dotgame:main"
 where = ["."]
 include = ["ai*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
 # ── Linting / formatting hints (not enforced) ─────────────────────────────────
 [tool.ruff]
 line-length = 100
