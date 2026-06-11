@@ -30,9 +30,16 @@ pitfalls, and conventions for the Dot Grid codebase.
 | `ai/nn_player.py` | Actor-critic NN, pure numpy, 15-channel input |
 | `ai/pytorch_player.py` | Residual CNN + PPO + GAE, 15-channel spatial input |
 | `ai/neural_mcts_player.py` | AlphaZero-style: CNN guides MCTS tree (policy=prior, value=leaf eval) |
-| `ai/runner.py` | Background thread wrapper |
-| `ai/trainer.py` | Offline self-play trainer (territory + arc shaping rewards) |
+| `ai/runner.py` | Background thread wrapper, `observe_opponent_move` forwarding |
+| `ai/trainer.py` | Offline self-play trainer (territory + arc shaping rewards), `SimGame` |
+| `ai/replay_trainer.py` | Replays recorded human games through the players' learning pipelines |
+| `ai/game_recorder.py` | Persists completed human games to `replay_buffer_GxG.json` (capped at `S.REPLAY_BUFFER_MAX`) |
 | `ai/paths.py` | Grid-stamped experience file path helper |
+
+> **Stale duplicates:** `runner.py`, `trainer.py` (repo root) and `ai/dotgame.py` are outdated
+> copies of `ai/runner.py`, `ai/trainer.py` and the root `dotgame.py`. The live entry point is
+> the root `dotgame.py` (`pyproject.toml: dot-grid = "dotgame:main"`), and all imports use the
+> `ai.` package. Never edit the stale copies; they should be deleted.
 
 ---
 
@@ -134,17 +141,21 @@ All board encoding and strategic signal computation. Shared by all three AI play
 ### `_arc_potential_comp` units
 
 Returns **territory-cell units** (not normalised to [0,1]). A ring enclosing 9 cells at 90%
-completion returns ~8.1. Divide by `(n-1)²` before use in blend weights (which
-`arc_potential_scalars` does automatically). In MCTS priors the raw value is divided inline:
-`float(own_arc[idx]) / total_cells * weight`.
+completion returns ~8.1. `arc_potential_scalars` divides by `(n-1)²` automatically for blend
+weights. In MCTS priors the raw value is used **un-normalised** — `arc_w` / `bridge_w` are
+deliberately calibrated in territory-cell units (see `settings.MCTS_PROFILES` comment:
+`arc_w = 0.22` → a 9-cell ring scores 1.98 ≈ half of one immediate close at `close_w = 4.0`).
+The NN encoders normalise by `(n-1)²` before writing channels 7–8.
 
 ### Why `enclosure_potential` vs `arc_potential_map`
 
 `enclosure_potential` (flood-fill) returns 0 for any ring with a single gap — completely blind
 during ring construction. `arc_potential_map` (bounding-box × completion) fires continuously from
 the first arc placed. MCTS priors and `_eval_fast` use `arc_potential_*`. The neural network
-input channels (ch 7–8) still use `enclosure_potential` because the NN can learn to infer ring
-progress from adjacent channels; replacing them would invalidate saved weights.
+input channels (ch 7–8) **also use `arc_potential_map` now** (normalised by `(n-1)²`); the switch
+is guarded by an encoding-version stamp in the weight files (`meta_enc_version` / `enc_version`
+== 2) — older enclosure-based weights are silently rejected on load. `enclosure_potential` /
+`_component_potential` remain in use by `disruption_map` and `enclosure_scalars`.
 
 `arc_potential_scalars` is also called in `Trainer._run()` to compute the arc-potential-delta
 shaping reward — this is the primary reward signal that teaches NN/PT ring-building strategy.
@@ -164,11 +175,15 @@ MCTSPlayer(player_id=2, profile=2)   # Strategist
 
 Profiles are defined in `settings.MCTS_PROFILES` as dicts with keys:
 `close_w, block_w, arc_w, arc_opp_w, bridge_w, bridge_opp_w, setup_w, adj_w, centrality_w,
-disrupt_w, noise_alpha, noise_frac, exploration, sel_terr_w`.
+disrupt_w, noise_alpha, noise_frac, exploration, sel_terr_w, eval_terr_w, eval_enc_w`.
+Profile 1 = "Opportunist" (close-focus, high noise), profile 2 = "Strategist" (ring/arc focus,
+patient). Labels live in `S.MCTS_PROFILE_LABELS`.
 
-Profile 0 (default) reads from the global `S.MCTS_*` constants — used for human vs MCTS and
-any other single-MCTS mode. Profiles 1 and 2 are applied in `dotgame._make_runners()` only when
-`mode == Mode.MCTS_VS_MCTS`.
+Profile 0 (default) uses the hard-coded defaults in `MCTSPlayer.__init__` plus the global
+`S.MCTS_NOISE_*` constants. `Mode.MCTS_VS_MCTS` always gets profiles 1 and 2 in
+`dotgame._make_runners()`; every other MCTS instance uses the profile the user picked on the
+Settings screen (`game_mcts_profile`, default 0). The training config screen has separate
+profile pickers per MCTS player.
 
 All per-instance weights are stored as `self._*` attributes on the player object and are
 immutable after construction.
@@ -205,11 +220,13 @@ raw = (own_s[idx]     * self._close_w       # immediate close
      + disrupt[idx]   * self._disrupt_w)    # disrupt opponent interior
 ```
 
-Default profile weights (profile 0): close=4.0, block=3.0, arc=5.0, arc_opp=4.0, bridge=3.0,
-bridge_opp=2.5, setup=2.5, adj=1.5, centrality=0.5, disrupt=0.3.
+Default profile weights (profile 0): close=4.0, block=3.0, arc=0.22, arc_opp=0.28, bridge=0.16,
+bridge_opp=0.14, setup=2.5, adj=1.5, centrality=0.5, disrupt=0.3.
 
-Arc and bridge values are in territory-cell units; divide by `total_cells` before applying
-weights (done inline in `choose_move`).
+Arc and bridge values stay in territory-cell units and are **not** divided by `total_cells` —
+`arc_w`/`bridge_w` are calibrated for raw units (a 9-cell ring × arc_w=0.22 ≈ 2.0, about half
+of one immediate close). Normalising them again would collapse ring signals into noise (this
+was a previous bug; see the comment block in `choose_move`).
 
 ### Dirichlet noise
 
@@ -238,16 +255,19 @@ combined = win_rate + self._sel_terr_w * score
 
 ### `_eval_fast`
 
-Four-signal blend for non-terminal rollout leaves (must be cheap — called ~500×/sec):
+Four-signal blend for non-terminal rollout leaves (must be cheap — called ~500×/sec). The
+territory/enclosure weights are now **per-profile** (`eval_terr_w`, `eval_enc_w`, defaults
+0.25/0.50), passed from `_rollout`:
 
 ```python
 own_arc, opp_arc = arc_potential_scalars(fb.board, ai_player)   # normalised [0,1]
 enc_pot = 0.5 + 0.5 * clip(own_arc - opp_arc, -1, 1)
-return 0.15*dot_ratio + 0.10*conn_ratio + 0.25*terr_pot + 0.50*enc_pot
+base_w  = max(0.0, 1.0 - terr_w - enc_w)        # remainder split 60/40
+return base_w*0.6*dot_ratio + base_w*0.4*conn_ratio + terr_w*terr_pot + enc_w*enc_pot
 ```
 
-Arc potential weight is 50% — intentionally dominant. `bridge_potential` is excluded from
-`_eval_fast` — it's O(G²·components) per call and would destroy rollout throughput.
+`bridge_potential` is excluded from `_eval_fast` — it's O(G²·components) per call and would
+destroy rollout throughput.
 
 ### Rollout policy (6 tiers)
 
@@ -270,11 +290,28 @@ Must remain O(1) in fast mode. The `len(board) >= n²` check is the fast path. T
 only runs when `S.MCTS_REAL_ROLLOUT = True`. Any future change that adds forbidden tracking to
 fast mode must also add the O(G²) scan.
 
-### `record_outcome`
+### `record_outcome` and experience
 
-Accepts `winner` (int, 0 = draw/unknown), `intermediate_rewards` (ignored), and `final_scores`
-(ignored — MCTS uses tree statistics). Both parameters exist for interface compatibility with
-`AIRunner`.
+No longer ignores its extra parameters. The experience outcome is a [0,1] **margin value**
+(`own_score / total_score`) when `final_scores` is provided, so a 30–5 win (0.86) warm-starts
+differently than a 16–15 squeaker (0.52). If `intermediate_rewards` is provided, a shaped
+signal is blended in at 20% (`0.80*outcome + 0.20*shaped01`).
+
+Both the player's own post-move positions (`_game_moves`) and positions observed via
+`observe_opponent_move` (`_obs_moves`) receive the outcome — every position the player occupied
+during the game contributes to the warm-start experience dict.
+
+### `observe_opponent_move`
+
+`BasePlayer` defines a no-op `observe_opponent_move(board, connections, player_who_moved, move,
+forbidden)` hook; **all four players override it** (symmetric learning). The contract: board /
+connections / forbidden are snapshots taken **before** the move. Implementations:
+
+- `MCTSPlayer` — records the resulting board key for warm-start experience.
+- `NNPlayer` / `PyTorchPlayer` — forward pass from the mover's perspective, store
+  (state, action, log_prob, value) in `_obs_traj`; trained at `record_outcome` with the
+  **inverted** terminal value (PT uses `PT_PPO_EPOCHS // 2` epochs for observed moves).
+- `NeuralMCTSPlayer` — one-hot policy target on the played move, stored in `_obs_episode`.
 
 ---
 
@@ -298,8 +335,9 @@ Accepts `winner` (int, 0 = draw/unknown), `intermediate_rewards` (ignored), and 
 
 ### Weight compatibility
 
-Saved metadata keys: `meta_grid`, `meta_hidden`, `meta_channels` (must equal 15). Mismatches
-silently rejected on load.
+Saved metadata keys: `meta_grid`, `meta_hidden`, `meta_channels` (must equal 15),
+`meta_enc_version` (must equal 2 — arc-potential channels 7–8). Mismatches silently rejected
+on load.
 
 ---
 
@@ -315,8 +353,9 @@ Policy Conv(64→2, 1×1) → flatten → Linear(2G²→G²)
 Value  Conv(64→1, 1×1) → flatten → Linear(G²→64) → ReLU → Linear(64→1)
 ```
 
-Architecture dict includes `'in_channels': 15` for load compatibility. Old weights without it
-or with `in_channels != 15` are silently rejected.
+Architecture dict includes `'in_channels': 15` for load compatibility, and the checkpoint
+carries `'enc_version': 2` (arc-potential channels 7–8). Old weights without either, or with
+mismatching values, are silently rejected.
 
 ### PPO training loop
 
@@ -336,6 +375,8 @@ or with `in_channels != 15` are silently rejected.
 - `on_game_end(winner, final_scores=None)` — forwards both to `record_outcome`.
 - `winner` may be `None` (draw); pass through without modification — player implementations
   handle `None` as a non-win outcome.
+- `observe_opponent_move(...)` — forwards to the player synchronously (cheap: dict hash for
+  MCTS, one forward pass for NN types). Called from the main loop with **pre-move** snapshots.
 - Snapshots `forbidden_positions` at `start_thinking()` — never reads live state from the thread.
 - `except Exception` in thread catches all failures; logs to stderr, returns random legal fallback.
 - `finally: self._thinking = False` always runs.
@@ -363,7 +404,8 @@ arc_before, _ = arc_potential_scalars(board_before, cp)
 arc_after,  _ = arc_potential_scalars(board_after,  cp)
 arc_delta = max(0.0, arc_after - arc_before)   # only positive increments rewarded
 
-shaping = terr_delta * S.REWARD_TERRITORY + arc_delta * S.REWARD_ARC_SHAPING
+shaping = clip(terr_delta * S.REWARD_TERRITORY
+               + arc_delta * S.REWARD_ARC_SHAPING, -1.0, 1.0)
 ```
 
 The arc shaping reward fixes the NN/PT "small-grab bias": without it the network sees a nonzero
@@ -373,6 +415,25 @@ step extending a ring arc is rewarded proportionally to the increase in ring-bui
 `arc_potential_scalars` is called twice per move (before and after) — this is O(G²·components)
 but acceptable at training speed (no real-time constraint). Do not add this to `_eval_fast`.
 
+### Symmetric observation
+
+After each move, `Trainer._run()` calls the **other** player's `observe_opponent_move` with the
+**pre-move** snapshots (`board_snap`, `conn_snap`, `forbidden_snap`) and the move — same
+contract as the live game loop.
+
+## Human-game replay (`ai/game_recorder.py`, `ai/replay_trainer.py`)
+
+When any human plays, `dotgame.py` accumulates `current_game_moves` (`[player, gx, gy]` per
+move) and calls `record_game()` at game end. Games are stored in `replay_buffer_GxG.json`,
+capped at `S.REPLAY_BUFFER_MAX` (oldest evicted), grid-stamped like weight files.
+
+`ReplayTrainer` re-simulates each saved game with `SimGame` and feeds **every** move to both
+players via `observe_opponent_move(board_before, …)` — the player's own moves become imitation
+targets, the opponent's moves are the usual symmetric signal — then calls
+`record_outcome(winner, final_scores=…)` to trigger the gradient update. Same
+`start/cancel/is_running/on_progress/on_done` interface as `Trainer`, so the training-progress
+UI works unchanged. Launched from the train-config screen's REPLAY button.
+
 ---
 
 ## Draw module (`draw.py`)
@@ -381,10 +442,11 @@ but acceptable at training speed (no real-time constraint). Do not add this to `
 
 ```
 picking_mode    → draw_mode_picker       → returns (mode_rects, name_rects, train_r, settings_r, arch_r)
-settings_screen → draw_settings_screen   → returns (back_r, prev_think_r, next_think_r, deep_terr_r)
+settings_screen → draw_settings_screen   → returns 6-tuple (back_r, prev_think_r, next_think_r,
+                                                            deep_terr_r, prev_prof_r, next_prof_r)
 arch_select     → draw_arch_select       → returns (back_r, mcts_r, nn_r, pt_r, nm_r)
 arch_overlay    → draw_arch_overlay      → returns (close_r, up_r, down_r, content_h)
-training_mode   → draw_train_config      → returns 11-tuple (see below)
+training_mode   → draw_train_config      → returns 16-tuple (see below)
 training        → draw_train_progress    → (no return value)
 paused          → draw_pause_menu        → returns (resume_r, new_game_r, quit_r)
 game over       → draw_win_screen        → (no return value)
@@ -401,16 +463,20 @@ Settings screens respectively. Always unpack as 5-tuple.
 
 ### `draw_train_config` return value
 
-Returns an **11-tuple**:
+Returns a **16-tuple**:
 
 ```python
-(back_r, start_r,
+(back_r, start_r, replay_r,
  prev_ai, next_ai, prev_opp, next_opp,
  prev_rnd, next_rnd, prev_think, next_think,
- deep_terr_r)   # ← new: toggle MCTS_REAL_ROLLOUT during training
+ deep_terr_r,                    # toggles MCTS_REAL_ROLLOUT directly
+ prev_ai_prof, next_ai_prof,     # None when AI is not MCTS
+ prev_opp_prof, next_opp_prof)   # None when opponent is not MCTS
 ```
 
-Always unpack as 11 values. The `deep_terr_r` button toggles `S.MCTS_REAL_ROLLOUT` directly.
+Always unpack as 16 values. `replay_r` starts a `ReplayTrainer` over the recorded human games
+(rounds value = repeat count); the profile pickers select `MCTS_PROFILES` entries per player and
+only render when that player resolves to MCTS.
 
 ### `draw_arch_select` return value
 
@@ -470,14 +536,25 @@ AI trigger and move application are both guarded by `not any_overlay`.
 
 The last two slots are always `None` — do not attempt to use them.
 
-### Train config 11-tuple unpack
+### Train config 16-tuple unpack
 
 ```python
-(back_r, start_r,
+(back_r, start_r, replay_r,
  pra, nxa, pro, nxo,
  prr, nxr, prt, nxt,
- train_deep_r) = train_cfg_rects
+ train_deep_r,
+ pr_aip, nx_aip,
+ pr_opp_p, nx_opp_p) = train_cfg_rects
 ```
+
+### Settings screen 6-tuple unpack
+
+```python
+back_r, prev_t, next_t, deep_r, prev_prof, next_prof = settings_rects
+```
+
+`prev_prof` / `next_prof` step `game_mcts_profile` (0–2), which is passed to `_make_runners()`
+for single-MCTS game modes.
 
 ### Arch select 5-tuple unpack
 
@@ -488,12 +565,15 @@ back_r, mcts_r, nn_r, pt_r, nm_r = arch_sel_rects
 ### MCTS profile assignment
 
 ```python
-p1_profile = 1 if (mode == Mode.MCTS_VS_MCTS and p1_type == 'mcts') else 0
-p2_profile = 2 if (mode == Mode.MCTS_VS_MCTS and p2_type == 'mcts') else 0
+if mode == Mode.MCTS_VS_MCTS:
+    p1_profile, p2_profile = 1, 2          # always Opportunist vs Strategist
+else:
+    p1_profile = profile if p1_type == 'mcts' else 0   # user-selected game_mcts_profile
+    p2_profile = profile if p2_type == 'mcts' else 0
 ```
 
-Only `MCTS_VS_MCTS` mode receives profiles 1 and 2. Every other MCTS use (human vs MCTS, etc.)
-uses profile 0 (global defaults), which behaves identically to the previous single-profile design.
+`MCTS_VS_MCTS` always gets profiles 1 and 2. Every other MCTS use receives the profile chosen
+on the Settings screen (`game_mcts_profile`, default 0 = global defaults).
 
 ### `on_game_end` — all three call sites pass `final_scores`
 
@@ -502,6 +582,15 @@ r.on_game_end(state.winner_player, final_scores=dict(state.scores))
 ```
 
 `state.winner_player` may be `None` (draw). `AIRunner` passes it through unchanged.
+
+### Move application — observe + record pattern
+
+Both move paths (AI pending-move and human click) follow the same sequence: snapshot
+`board/connections/forbidden_positions` **before** `state.place()`, then append
+`[player, gx, gy]` to `current_game_moves`, then call the *other* runner's
+`observe_opponent_move(pre_move_snapshots, mover, move)` (only if that side is not human).
+At game end, if any player is human, `record_game(current_game_moves, winner or 0, scores)`
+saves the game to the replay buffer; `current_game_moves` is then cleared (also on new game).
 
 ### Stop button draw condition
 
@@ -538,12 +627,26 @@ Q + c_puct · P(s,a) · √N(s) / (1 + N(s,a))
 ### `choose_move` flow
 
 1. Single network call at root → `root_priors` (policy) + `root_val` (stored for training)
-2. Tactical boost applied to `root_priors` as safety net for untrained network
+2. `_tactical_priors` applied to root priors (see below), with dead-spot suppression enabled
 3. Dirichlet noise injected (adaptive alpha, same formula as `MCTSPlayer`)
 4. Root's children pre-populated with those priors (no tree reuse — stateless between turns)
-5. MCTS loop: `_select` → if leaf: `_expand_node` (network call) → `_backprop`; no rollouts
+5. MCTS loop: `_select` → if leaf: `_expand_node` (network call + `_tactical_priors` without
+   dead-spot suppression) → `_backprop`; no rollouts
 6. Visit distribution stored in `self._episode`
 7. Most-visited child chosen (always `argmax(visits)`)
+
+### `_tactical_priors` — phase-decayed exponential boost
+
+Replaces the linear `apply_boost` used by NN/PT. Two mechanisms:
+
+1. **Exponential boost**: priors are multiplied by `base^(2 × score × decay)` where
+   `decay = max(0.3, 1 − game_phase)`. At phase 0 a 2.5-pt close gets ~1024×, so even a badly
+   miscalibrated network cannot skip a forced capture; by phase 1.0 the boost is 30% of maximum
+   so a trained network can override it with a ring strategy.
+2. **Dead-spot suppression** (root only — `suppress_dead=True`): legal positions with zero
+   immediate score AND zero arc potential are divided by `S.NM_DEAD_SPOT_PENALTY`, but only
+   once at least one productive move exists (an empty board is unaffected). Skipped inside the
+   tree because `arc_potential_map` is O(G²).
 
 ### No tree reuse
 
@@ -559,8 +662,13 @@ L = NM_POLICY_COEF  · CE(π_mcts, π_net)    # cross-entropy: replicate visit d
   - NM_ENTROPY_COEF · H(π_net)              # entropy: keep exploration alive
 ```
 
-One Adam step per game — no PPO, no minibatch shuffling. The visit distribution is a stable
-external supervised target; PPO's stability mechanisms are not needed here.
+One Adam step per game for own moves — no PPO, no minibatch shuffling. The visit distribution
+is a stable external supervised target; PPO's stability mechanisms are not needed here. A
+**second** Adam step trains on `_obs_episode` (observed opponent moves: one-hot policy targets,
+inverted terminal, no shaping).
+
+Entropy is computed over **legal positions only** (`torch.where(masks, log_probs, 0)`) so the
+gradient at low-probability legal moves is never suppressed by the illegal-position zeroing.
 
 GAE is identical to `PyTorchPlayer` (same γ, λ, shaping rewards). Intermediate rewards contain
 both territory-delta and arc-potential-delta shaping from `Trainer`.
@@ -587,6 +695,7 @@ NM_ENTROPY_COEF     = 0.01
 NM_C_PUCT           = 1.5
 NM_NOISE_ALPHA      = 0.3
 NM_NOISE_FRAC       = 0.25
+NM_DEAD_SPOT_PENALTY = 5.0   # divide prior of zero-potential positions
 NM_OVERRIDE         = None   # {'blocks': 4, 'channels': 64}
 ```
 
@@ -618,14 +727,20 @@ same as `PyTorchPlayer`.
   `not picking_mode`).
 - AI `choose_move` runs in a thread — never write to `state.*` from inside it.
 - `draw_panel` returns **5 values** — always unpack as `(a, b, c, _, _)`.
-- `draw_train_config` returns **11 values** — always include `train_deep_r` in the unpack.
+- `draw_train_config` returns **16 values**; `draw_settings_screen` returns **6 values**.
 - `winner_player` can be `None` (draw) — all rendering and record_outcome paths must handle it.
-- `MCTSPlayer.record_outcome` accepts `final_scores` for interface compatibility but ignores it.
-- `MCTSPlayer(profile=0)` uses global `S.MCTS_*` defaults; profiles 1/2 override all weights.
+- `observe_opponent_move` must always receive **pre-move** snapshots (board/connections/
+  forbidden as they were before the move). Passing the post-move board corrupts training:
+  the action position is occupied → masked → `log_prob = -inf` → PPO ratio blows up.
+- `MCTSPlayer(profile=0)` uses the hard-coded defaults in `__init__`; profiles 1/2 override all
+  weights including the `eval_terr_w`/`eval_enc_w` rollout-leaf weights.
 - `_check_terminal` must remain O(1) in fast mode — any change that adds forbidden tracking to
   fast mode must also add the O(G²) scan path.
-- `_arc_potential_comp` returns values in **territory-cell units**, not [0,1]. Divide by
-  `(n-1)²` before use in blend weights or comparisons with `own_s`.
+- `_arc_potential_comp` returns values in **territory-cell units**, not [0,1]. MCTS priors use
+  them raw (weights calibrated for cell units); NN channels and `_eval_fast` normalise by
+  `(n-1)²` first. Don't re-normalise in the priors — that was a fixed bug.
+- Root-level `runner.py` / `trainer.py` and `ai/dotgame.py` are **stale duplicates** — the live
+  files are `ai/runner.py`, `ai/trainer.py`, and the root `dotgame.py`.
 - `bridge_potential` uses `_arc_potential_comp` internally (not `_component_potential`) so it
   returns non-zero values for partial rings. Keep it this way.
 - `arc_potential_scalars` is called in the trainer loop on every move — this is intentional and
@@ -660,6 +775,8 @@ same as `PyTorchPlayer`.
 2. Implement `choose_move(board, connections, player, scores, forbidden=None)`.
 3. Implement `record_outcome(winner, intermediate_rewards=None, final_scores=None)`.
    Handle `winner=None` (draw) and `winner=0` (draw/unknown from Trainer).
+   Optionally override `observe_opponent_move(board, connections, player_who_moved, move,
+   forbidden)` for symmetric learning — arguments are pre-move snapshots; default is a no-op.
 4. Implement `save()` and `load()` using `experience_path()` from `ai/paths.py`.
 5. Add to `_make_runner()` / `_make_runners()` in `dotgame.py` with an `_AVAILABLE` guard if
    the backend requires optional dependencies (see `_PT_AVAILABLE`, `_NM_AVAILABLE` pattern).
