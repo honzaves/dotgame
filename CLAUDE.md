@@ -36,11 +36,6 @@ pitfalls, and conventions for the Dot Grid codebase.
 | `ai/game_recorder.py` | Persists completed human games to `replay_buffer_GxG.json` (capped at `S.REPLAY_BUFFER_MAX`) |
 | `ai/paths.py` | Grid-stamped experience file path helper |
 
-> **Stale duplicates:** `runner.py`, `trainer.py` (repo root) and `ai/dotgame.py` are outdated
-> copies of `ai/runner.py`, `ai/trainer.py` and the root `dotgame.py`. The live entry point is
-> the root `dotgame.py` (`pyproject.toml: dot-grid = "dotgame:main"`), and all imports use the
-> `ai.` package. Never edit the stale copies; they should be deleted.
-
 ---
 
 ## State module (`state.py`)
@@ -739,8 +734,6 @@ same as `PyTorchPlayer`.
 - `_arc_potential_comp` returns values in **territory-cell units**, not [0,1]. MCTS priors use
   them raw (weights calibrated for cell units); NN channels and `_eval_fast` normalise by
   `(n-1)²` first. Don't re-normalise in the priors — that was a fixed bug.
-- Root-level `runner.py` / `trainer.py` and `ai/dotgame.py` are **stale duplicates** — the live
-  files are `ai/runner.py`, `ai/trainer.py`, and the root `dotgame.py`.
 - `bridge_potential` uses `_arc_potential_comp` internally (not `_component_potential`) so it
   returns non-zero values for partial rings. Keep it this way.
 - `arc_potential_scalars` is called in the trainer loop on every move — this is intentional and
