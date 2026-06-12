@@ -417,6 +417,7 @@ class MCTSPlayer(BasePlayer):
         self.experience: dict = {}
         self._game_moves: list = []
         self._obs_moves:  list = []   # board states resulting from opponent moves
+        self._learning_shared: bool = False
 
         # ── Per-instance weights (set from profile or global defaults) ────────
         p = S.MCTS_PROFILES.get(profile, {})
@@ -634,6 +635,8 @@ class MCTSPlayer(BasePlayer):
         so a position reached by a strong opponent move that leads to our loss
         accumulates a low wins/visits ratio, teaching us to recognise danger.
         """
+        if self._learning_shared:
+            return
         gx, gy = move
         new_board = dict(board)
         new_board[(gx, gy)] = player_who_moved
@@ -648,6 +651,15 @@ class MCTSPlayer(BasePlayer):
         # Build the board key directly (same format as _board_key)
         key = str(sorted((bx, by, p) for (bx, by), p in new_board.items()))
         self._obs_moves.append(key)
+
+    def share_learning_with(self, other: 'MCTSPlayer') -> None:
+        """Share the experience dict with *other* (self-play pairs).
+
+        Disables opponent-observation recording on both sides: with one
+        shared dict, the partner's own-move recording already covers those
+        positions (recording both would double-count every visit)."""
+        other.experience = self.experience
+        self._learning_shared = other._learning_shared = True
 
     def record_outcome(self, winner: int, intermediate_rewards=None,
                        final_scores: dict | None = None) -> None:

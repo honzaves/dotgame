@@ -105,15 +105,17 @@ def _make_runners(mode: Mode, profile: int = 0) -> dict:
     # Strategist) so the players pursue different strategies rather than mirroring.
     # All other MCTS instances use the player-selected profile from settings.
     if mode == Mode.MCTS_VS_MCTS:
-        p1_profile = 1
-        p2_profile = 2
+        p1_profile, p2_profile = 1, 2
     else:
         p1_profile = profile if p1_type == 'mcts' else 0
         p2_profile = profile if p2_type == 'mcts' else 0
-    return {
-        1: _make_runner(1, p1_type, p1_profile),
-        2: _make_runner(2, p2_type, p2_profile),
-    }
+    r1 = _make_runner(1, p1_type, p1_profile)
+    r2 = _make_runner(2, p2_type, p2_profile)
+    # Same-type self-play: share one network / experience store so the two
+    # sides don't clobber each other's learning at save time.
+    if p1_type == p2_type and p1_type != 'human':
+        r1._player.share_learning_with(r2._player)
+    return {1: r1, 2: r2}
 
 
 # ── New game ──────────────────────────────────────────────────────────────────
@@ -493,6 +495,8 @@ def main():
                                     training_mode = False
                                     picking_mode  = True
                                 else:
+                                    if resolved_opp == ai_label:
+                                        rp1.share_learning_with(rp2)
                                     n_repeats  = _TRAIN_ROUND_PRESETS[train_rnd_idx]
                                     n_games    = count_games()
                                     total_reps = n_games * n_repeats
@@ -538,6 +542,8 @@ def main():
                                 training_mode = False
                                 picking_mode  = True
                             else:
+                                if resolved_opp == ai_label:
+                                    tp1.share_learning_with(tp2)
                                 S.AI_THINK_MS = S.AI_THINK_PRESETS[train_think_idx]
                                 n_rounds = _TRAIN_ROUND_PRESETS[train_rnd_idx]
                                 train_progress[:] = [0, n_rounds, {}]

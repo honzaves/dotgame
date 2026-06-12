@@ -142,6 +142,7 @@ class NeuralMCTSPlayer(BasePlayer):
         # Observed opponent moves — same tuple format but encoded from the
         # opponent's perspective; trained with inverted terminal value.
         self._obs_episode: list[tuple] = []
+        self._learning_shared: bool = False
         self.load()
 
     # ── BasePlayer interface ──────────────────────────────────────────────────
@@ -417,6 +418,13 @@ class NeuralMCTSPlayer(BasePlayer):
 
         self.save()
 
+    def share_learning_with(self, other: 'NeuralMCTSPlayer') -> None:
+        """Make *other* train and act with this player's network/optimizer."""
+        other._net  = self._net
+        other._opt  = self._opt
+        other._arch = self._arch
+        self._learning_shared = other._learning_shared = True
+
     def observe_opponent_move(self, board, connections, player_who_moved,
                               move, forbidden=None) -> None:
         """Record an opponent's move as a training example.
@@ -427,6 +435,8 @@ class NeuralMCTSPlayer(BasePlayer):
         At record_outcome these are trained with the inverted terminal value
         so the network learns to evaluate positions from both sides.
         """
+        if self._learning_shared:
+            return
         forbidden = forbidden or set()
         n = S.GRID
         gx, gy = move

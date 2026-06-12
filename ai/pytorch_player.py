@@ -186,6 +186,7 @@ class PyTorchPlayer(BasePlayer):
         # Trajectory: (enc_np, mask_np, action, log_prob_old, value_old, boost_np)
         self._traj:     list[tuple] = []
         self._obs_traj: list[tuple] = []  # opponent-observed tuples, same 6-element layout
+        self._learning_shared: bool = False
         self.load()
 
     # ── BasePlayer interface ──────────────────────────────────────────────────
@@ -447,6 +448,13 @@ class PyTorchPlayer(BasePlayer):
 
         self.save()
 
+    def share_learning_with(self, other: 'PyTorchPlayer') -> None:
+        """Make *other* train and act with this player's network/optimizer."""
+        other._net  = self._net
+        other._opt  = self._opt
+        other._arch = self._arch
+        self._learning_shared = other._learning_shared = True
+
     def observe_opponent_move(self, board, connections, player_who_moved,
                               move, forbidden=None) -> None:
         """Record an opponent's move as a training example.
@@ -456,6 +464,8 @@ class PyTorchPlayer(BasePlayer):
         and their value estimate, then stores the tuple in _obs_traj.
         At record_outcome these steps are trained with the inverted terminal.
         """
+        if self._learning_shared:
+            return
         forbidden = forbidden or set()
         n = S.GRID
         gx, gy = move

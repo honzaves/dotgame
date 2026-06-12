@@ -333,6 +333,7 @@ class NNPlayer(BasePlayer):
         # trajectory: (enc, action, acts, value_pred, boost, legal_mask)
         self._traj:     list = []
         self._obs_traj: list = []  # opponent-observed steps (enc, action, acts, val, boost, legal)
+        self._learning_shared: bool = False
         self.load()
 
     def choose_move(self, board, connections, player, scores,
@@ -453,6 +454,12 @@ class NNPlayer(BasePlayer):
 
         self.save()
 
+    def share_learning_with(self, other: 'NNPlayer') -> None:
+        """Make *other* train and act with this player's network."""
+        other._net    = self._net
+        other._hidden = self._hidden
+        self._learning_shared = other._learning_shared = True
+
     def observe_opponent_move(self, board, connections, player_who_moved,
                               move, forbidden=None) -> None:
         """Record an opponent's move as a training example.
@@ -462,6 +469,8 @@ class NNPlayer(BasePlayer):
         value estimate, then stores in _obs_traj for training at game end
         with the inverted terminal value.
         """
+        if self._learning_shared:
+            return
         forbidden = forbidden or set()
         n = S.GRID
         gx, gy = move
