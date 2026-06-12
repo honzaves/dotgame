@@ -319,7 +319,12 @@ class PyTorchPlayer(BasePlayer):
                     logits, vals_pred = self._net(b_states)
 
                     logits = logits + boosts_t[batch]
-                    logits[~b_masks] = float('-inf')
+                    # Use a large finite negative instead of -inf so that
+                    # autograd can backprop cleanly.  -inf produces
+                    # 0 * (-inf) = NaN in the entropy term and NaN gradients
+                    # through the entire network.  exp(-1e9) ≈ 0, giving the
+                    # same distribution while keeping all tensors finite.
+                    logits = logits.masked_fill(~b_masks, -1e9)
                     log_p_all = F.log_softmax(logits, dim=1)
                     log_p     = log_p_all.gather(
                         1, b_actions.unsqueeze(1)).squeeze(1)
@@ -418,7 +423,9 @@ class PyTorchPlayer(BasePlayer):
 
                     logits, vals_pred = self._net(b_states)
                     logits = logits + obs_boosts_t[batch]
-                    logits[~b_masks] = float('-inf')
+                    # Same finite-masking fix as the own-move PPO loop above:
+                    # use -1e9 instead of -inf to keep autograd gradients finite.
+                    logits = logits.masked_fill(~b_masks, -1e9)
                     log_p_all = F.log_softmax(logits, dim=1)
                     log_p     = log_p_all.gather(
                         1, b_actions.unsqueeze(1)).squeeze(1)
