@@ -81,3 +81,35 @@ class TestTreeReuse:
         p.choose_move({}, set(), 1, {1: 0.0, 2: 0.0}, set())
         assert p._saved_root is not None
         assert p._saved_board is not None
+
+
+class TestVirtualLoss:
+    def test_apply_and_revert_restores_counts(self):
+        from ai.neural_mcts_player import _NMNode, NeuralMCTSPlayer
+        root  = _NMNode(None, None, [], player_who_moved=2)
+        child = _NMNode((1, 1), root, None, player_who_moved=1)
+        root.children = [child]
+        root.visits, root.total_value   = 5, 2.5
+        child.visits, child.total_value = 3, 1.0
+        NeuralMCTSPlayer._apply_virtual(child, ai_player=1, sign=+1)
+        assert (child.visits, root.visits) == (4, 6)
+        NeuralMCTSPlayer._apply_virtual(child, ai_player=1, sign=-1)
+        assert (child.visits, child.total_value) == (3, 1.0)
+        assert (root.visits, root.total_value)   == (5, 2.5)
+
+
+class TestBatchedSearch:
+    def test_choose_move_returns_legal_and_counts_consistent(self):
+        S.AI_THINK_MS = 60
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        board = {(4, 4): 2}
+        move = p.choose_move(board, set(), 1, {1: 0.0, 2: 0.0}, set())
+        assert move not in board
+        root = p._saved_root        # chosen child saved by tree reuse
+        assert root.visits >= 1
+        assert root.visits >= sum(c.visits for c in (root.children or []))
+        def no_negative(n):
+            assert n.visits >= 0
+            for c in (n.children or []):
+                no_negative(c)
+        no_negative(root)

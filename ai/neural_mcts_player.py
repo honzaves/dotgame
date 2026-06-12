@@ -75,7 +75,7 @@ class _NMNode:
     """
 
     __slots__ = ('move', 'parent', 'children', 'visits', 'total_value',
-                 'player_who_moved', 'prior')
+                 'player_who_moved', 'prior', 'pending')
 
     def __init__(self, move, parent, children, player_who_moved, prior=0.0):
         self.move             = move
@@ -85,6 +85,7 @@ class _NMNode:
         self.total_value      = 0.0       # sum of backpropagated values
         self.player_who_moved = player_who_moved
         self.prior            = prior     # P(s,a) from parent's network evaluation
+        self.pending          = False     # awaiting batched network evaluation
 
     def puct(self, c_puct: float) -> float:
         """AlphaZero PUCT:  Q(s,a)  +  c_puct · P(s,a) · √N(s) / (1 + N(s,a))
@@ -273,30 +274,50 @@ class NeuralMCTSPlayer(BasePlayer):
                     prior=float(root_priors[gy * n + gx])))
 
         # ── MCTS simulations ──────────────────────────────────────────────────
-        deadline = time.time() + S.AI_THINK_MS / 1000.0
+        deadline   = time.time() + S.AI_THINK_MS / 1000.0
+        batch_size = getattr(S, 'NM_LEAF_BATCH', 8)
 
         while time.time() < deadline:
-            node, sim_fb = self._select(root, fb.copy())
+            pending = []                 # (node, sim_fb) awaiting evaluation
+            for _ in range(batch_size):
+                node, sim_fb = self._select(root, fb.copy())
 
-            if sim_fb.done:
-                # Terminal state: use actual score ratio
-                s1, s2 = sim_fb.scores.get(1, 0.0), sim_fb.scores.get(2, 0.0)
-                total  = (s1 + s2) or 1.0
-                val01  = (s1 if player == 1 else s2) / total
-            elif node.children is None:
-                # First visit to this node → expand and evaluate with network
-                raw_v = self._expand_node(node, sim_fb)
-                # raw_v ∈ [-1,1] from sim_fb.player's perspective;
-                # convert to [0,1] from ai_player (= player) perspective
-                if sim_fb.player == player:
+                if sim_fb.done:
+                    s1, s2 = sim_fb.scores.get(1, 0.0), sim_fb.scores.get(2, 0.0)
+                    total  = (s1 + s2) or 1.0
+                    val01  = (s1 if player == 1 else s2) / total
+                    self._backprop(node, val01, player)
+                    continue
+                if node.children is not None:
+                    # Expanded non-terminal with nothing to descend — neutral.
+                    self._backprop(node, 0.5, player)
+                    continue
+                if node.pending:
+                    # Virtual loss couldn't steer away — batch is saturated.
+                    break
+                node.pending = True
+                self._apply_virtual(node, player, +1)
+                pending.append((node, sim_fb))
+
+            if not pending:
+                continue
+
+            encs = np.stack([
+                _encode(fb_.board, fb_.connections, fb_.forbidden, fb_.player)
+                for _, fb_ in pending])
+            with torch.no_grad():
+                x = torch.tensor(encs, dtype=torch.float32, device=self._device)
+                lg, v = self._net(x)
+
+            for i, (node, fb_) in enumerate(pending):
+                self._apply_virtual(node, player, -1)
+                node.pending = False
+                raw_v = self._expand_with(node, fb_, lg[i], float(v[i].item()))
+                if fb_.player == player:
                     val01 = (raw_v + 1.0) / 2.0
                 else:
                     val01 = (1.0 - raw_v) / 2.0
-            else:
-                # All children visited but no legal moves: shouldn't happen
-                val01 = 0.5
-
-            self._backprop(node, val01, player)
+                self._backprop(node, val01, player)
 
         # ── Visit distribution for policy training ────────────────────────────
         visit_dist = np.zeros(n * n, dtype=np.float32)
@@ -561,38 +582,24 @@ class NeuralMCTSPlayer(BasePlayer):
             node = best
         return node, fb
 
-    def _expand_node(self, node: _NMNode, fb) -> float:
-        """First visit to node: call network to get policy + value.
-
-        Populates node.children with priors from the policy head.
-        Returns raw value in [-1, 1] from fb.player's perspective.
-        """
+    def _expand_with(self, node: '_NMNode', fb, logits_row, value: float) -> float:
+        """Populate node.children from a precomputed network output row.
+        Returns the value in [-1, 1] from fb.player's perspective."""
         legal = fb.legal_moves()
         if not legal:
             node.children = []
             return 0.0
+        n    = S.GRID
+        mask = torch.zeros(n * n, dtype=torch.bool, device=self._device)
+        for gx, gy in legal:
+            mask[gy * n + gx] = True
+        lg = logits_row.clone()
+        lg[~mask] = float('-inf')
+        priors = F.softmax(lg, dim=0).cpu().numpy()
 
-        enc = _encode(fb.board, fb.connections, fb.forbidden, fb.player)
-        with torch.no_grad():
-            x  = torch.tensor(enc, dtype=torch.float32,
-                               device=self._device).unsqueeze(0)
-            lg, v = self._net(x)
-            lg    = lg[0].clone()
-            n     = S.GRID
-            mask  = torch.zeros(n * n, dtype=torch.bool, device=self._device)
-            for gx, gy in legal:
-                mask[gy * n + gx] = True
-            lg[~mask] = float('-inf')
-            priors = F.softmax(lg, dim=0).cpu().numpy()
-
-        # Apply tactical correction inside the tree too — otherwise every
-        # simulation uses raw network priors that may strongly favour useless
-        # moves over obvious immediate scores deep in the search.
-        # Skip dead-spot suppression here for speed (arc_potential_map is O(G²)).
-        legal_mask_np = mask.cpu().numpy()
         node_phase = len(fb.board) / max(n * n, 1)
         priors = self._tactical_priors(
-            priors, fb.board, fb.connections, fb.player, legal_mask_np,
+            priors, fb.board, fb.connections, fb.player, mask.cpu().numpy(),
             suppress_dead=False, game_phase=node_phase)
 
         node.children = [
@@ -601,7 +608,33 @@ class NeuralMCTSPlayer(BasePlayer):
                     prior=float(priors[gy * n + gx]))
             for gx, gy in legal
         ]
-        return float(v[0].item())
+        return value
+
+    def _expand_node(self, node: _NMNode, fb) -> float:
+        """Single-leaf expansion (kept for clarity/compat): one network call.
+
+        Populates node.children with priors from the policy head.
+        Returns raw value in [-1, 1] from fb.player's perspective.
+        """
+        enc = _encode(fb.board, fb.connections, fb.forbidden, fb.player)
+        with torch.no_grad():
+            x = torch.tensor(enc, dtype=torch.float32,
+                             device=self._device).unsqueeze(0)
+            lg, v = self._net(x)
+        return self._expand_with(node, fb, lg[0], float(v[0].item()))
+
+    @staticmethod
+    def _apply_virtual(node: '_NMNode', ai_player: int, sign: int) -> None:
+        """Apply (+1) or revert (-1) a virtual loss along the path to root.
+
+        Pending leaves are temporarily scored as a loss for ai_player so the
+        next selection in the same batch explores a different leaf."""
+        cur = node
+        while cur is not None:
+            cur.visits += sign
+            if cur.player_who_moved != ai_player:
+                cur.total_value += sign      # a win for the opponent
+            cur = cur.parent
 
     @staticmethod
     def _tactical_priors(

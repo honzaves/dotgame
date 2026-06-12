@@ -198,6 +198,7 @@ NM_BATCH_SIZE       = 256              # minibatch size per training step
 NM_TRAIN_STEPS      = 4                # minibatches sampled per finished game
 NM_Z_WEIGHT         = 0.5             # blend of final outcome z into value target
 NM_AUGMENT          = True             # random D4 transform per sampled item
+NM_LEAF_BATCH       = 8                # leaves evaluated per batched network call
 
 NM_OVERRIDE         = None             # override architecture: {'blocks':4,'channels':64}
 
