@@ -200,11 +200,17 @@ lookahead instead of reacting to the current board alone.
   - Policy head output → PUCT prior for each child (replaces hand-crafted `raw_priors`)
   - Value head output → leaf evaluation (replaces random rollouts entirely)
   - No rollouts at all: one network call per new leaf, then backpropagate the value
-- **Training signal:** two targets per game
+- **Training signal:** two targets per position
   - *Policy target:* MCTS visit distribution `π_mcts` — more accurate than the raw network prior
-  - *Value target:* GAE returns from territory-delta + arc-potential-delta shaping (same as PT)
-- **Loss:** `NM_POLICY_COEF · CE(π_mcts, π_net) + NM_VALUE_COEF · MSE(v, return) − entropy`
+  - *Value target:* GAE returns (territory + arc shaping, same as PT) blended with the final
+    outcome `z` by `NM_Z_WEIGHT`
+- **Replay buffer:** finished games land in an in-memory buffer (`NM_BUFFER_MAX` samples);
+  each game triggers `NM_TRAIN_STEPS` minibatches of `NM_BATCH_SIZE`, every sampled item
+  getting a random board rotation/mirror (`NM_AUGMENT` — 8× sample efficiency)
+- **Loss:** `NM_POLICY_COEF · CE(π_mcts, π_net) + NM_VALUE_COEF · MSE(v, target) − entropy`
 - No PPO needed — visit distributions are a stable supervised signal, not a self-bootstrapped estimate
+- **Search speed:** leaves are evaluated in batches of `NM_LEAF_BATCH` per network call
+  (virtual loss spreads the batch across the tree), and the chosen subtree is reused next turn
 - **Self-improvement loop:** stronger network → better priors + leaf values → better search → better training data → stronger network
 - Weights file: `nm_weights_<GRID>x<GRID>.pt`
 
@@ -350,6 +356,12 @@ be ignored. MCTS experience is grid-stamped and always compatible.
 | `NM_C_PUCT` | 1.5 | PUCT exploration constant |
 | `NM_NOISE_ALPHA` | 0.3 | Dirichlet noise concentration at root |
 | `NM_NOISE_FRAC` | 0.25 | Fraction of root prior that comes from noise |
+| `NM_BUFFER_MAX` | 8000 | Replay-buffer size (training samples kept in memory) |
+| `NM_BATCH_SIZE` | 256 | Minibatch size per training step |
+| `NM_TRAIN_STEPS` | 4 | Minibatches sampled per finished game |
+| `NM_Z_WEIGHT` | 0.5 | Final-outcome blend in NM value targets |
+| `NM_AUGMENT` | `True` | Random D4 board transform per sampled training item |
+| `NM_LEAF_BATCH` | 8 | Leaves evaluated per batched network call |
 | `PLAYER_NAMES` | `{1:"Player I",…}` | Default display names |
 
 ---
