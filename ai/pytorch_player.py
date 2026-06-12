@@ -2,20 +2,24 @@
 
 Architecture
 ------------
-Input   : (5, GRID, GRID) spatial tensor
+Input   : (15, GRID, GRID) spatial tensor
   ch 0  : own dots
   ch 1  : opponent dots
   ch 2  : forbidden positions
   ch 3  : own connections mask   (1.0 at every cell touched by an own edge)
   ch 4  : opponent connections mask
+  ch 5–14: strategic signal channels (see encode_state)
 
 Residual trunk:
-  stem  : Conv2d(5 → 64, 3×3, padding=1) → BN → ReLU
+  stem  : Conv2d(15 → 64, 3×3, padding=1) → GroupNorm → ReLU
   blocks: N × ResBlock(64 channels)
-    each block: Conv(64→64,3×3,p=1)→BN→ReLU→Conv(64→64,3×3,p=1)→BN + skip→ReLU
+    each block: Conv(64→64,3×3,p=1)→GN→ReLU→Conv(64→64,3×3,p=1)→GN + skip→ReLU
 
 Policy head : Conv(64→2,1×1) → flatten → Linear(2·G² → G²)
 Value head  : Conv(64→1,1×1) → flatten → Linear(G² → 64) → ReLU → Linear(64→1)
+
+Normalisation: GroupNorm (8 groups) throughout — no running stats, no train/eval
+               mode difference, safe for batch-size-1 inference.
 
 Training — PPO with GAE  (same algorithm as before, improved network)
 """
@@ -104,13 +108,19 @@ def _build_net(grid: int, n_blocks: int, channels: int = 64):
     if not _TORCH_AVAILABLE:
         raise ImportError("PyTorch not available")
 
+    def _norm(ch):
+        # GroupNorm: no running stats, identical behaviour in train/eval —
+        # safe for batch-size-1 inference (BatchNorm was silently using
+        # batch statistics AND mutating running stats on every forward).
+        return nn.GroupNorm(8 if ch % 8 == 0 else 1, ch)
+
     class ResBlock(nn.Module):
         def __init__(self, ch):
             super().__init__()
             self.conv1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
-            self.bn1   = nn.BatchNorm2d(ch)
+            self.bn1   = _norm(ch)
             self.conv2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
-            self.bn2   = nn.BatchNorm2d(ch)
+            self.bn2   = _norm(ch)
 
         def forward(self, x):
             h = F.relu(self.bn1(self.conv1(x)))
@@ -123,7 +133,7 @@ def _build_net(grid: int, n_blocks: int, channels: int = 64):
             # Stem
             self.stem = nn.Sequential(
                 nn.Conv2d(15, channels, 3, padding=1, bias=False),
-                nn.BatchNorm2d(channels),
+                _norm(channels),
                 nn.ReLU(),
             )
             # Residual tower
@@ -166,7 +176,7 @@ class PyTorchPlayer(BasePlayer):
         self.player_id = player_id
         self._device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         arch           = S.pt_arch()
-        self._arch     = {**arch, 'in_channels': 15}  # includes channel count for compat check
+        self._arch     = {**arch, 'in_channels': 15, 'norm': 'gn'}
         self._net      = _build_net(
             S.GRID, arch['blocks'], arch['channels']
         ).to(self._device)

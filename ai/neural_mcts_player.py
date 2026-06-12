@@ -128,7 +128,7 @@ class NeuralMCTSPlayer(BasePlayer):
         self.player_id = player_id
         self._device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         arch           = S.nm_arch()
-        self._arch     = {**arch, 'in_channels': 15}  # stored for load-compat check
+        self._arch     = {**arch, 'in_channels': 15, 'norm': 'gn'}
         self._net      = _build_nm_net(
             S.GRID, arch['blocks'], arch['channels']
         ).to(self._device)
