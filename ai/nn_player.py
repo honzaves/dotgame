@@ -2,7 +2,7 @@
 
 Improvements over the previous version
 ---------------------------------------
-5-CHANNEL INPUT
+15-CHANNEL INPUT
     Channels: own dots | opponent dots | forbidden | own conn mask | opp conn mask
     Connection masks give the network direct visibility of the graph structure —
     the most important spatial relationship — which the 3-channel encoding hid.
@@ -31,8 +31,8 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import (opportunity_masks, apply_boost, arc_potential_map,
-                          strategic_channels)
+from ai.features import (opportunity_masks, boost_log_offsets,
+                          arc_potential_map, strategic_channels)
 
 # Adam hyper-parameters
 _BETA1  = 0.9
@@ -128,9 +128,11 @@ class _ACNetwork:
         value  = float(np.tanh(h @ self._val_w.w + self._val_b.w)[0])
         return logits, value, acts
 
-    def policy(self, x: np.ndarray, legal_mask: np.ndarray):
+    def policy(self, x: np.ndarray, legal_mask: np.ndarray, boost=None):
         logits, value, acts = self.forward(x)
         masked = logits.copy()
+        if boost is not None:
+            masked += boost
         masked[~legal_mask] = -1e9
         probs = _softmax(masked)
         return probs, value, acts
@@ -138,25 +140,38 @@ class _ACNetwork:
     # ── Update (one transition) ───────────────────────────────────────────────
 
     def update(self, acts: list, action: int, advantage: float,
-               value_target: float, entropy_bonus: float, lr: float) -> None:
-        """Adam step for one (state, action, advantage, value_target) tuple."""
+               value_target: float, entropy_bonus: float, lr: float,
+               legal_mask=None, boost_log=None) -> None:
+        """Adam step for one (state, action, advantage, value_target) tuple.
+
+        legal_mask / boost_log reproduce the exact distribution the action
+        was sampled from — without them the gradient pushes probability mass
+        toward illegal positions and mismatches the behaviour policy.
+        """
         self._t += 1
         t  = self._t
         h  = acts[-1]   # trunk output
 
-        # ── Policy head ───────────────────────────────────────────────────────
-        probs     = _softmax(h @ self._pol_w.w + self._pol_b.w)
+        # ── Policy head (masked + boosted softmax) ───────────────────────────
+        logits = h @ self._pol_w.w + self._pol_b.w
+        if boost_log is not None:
+            logits = logits + boost_log
+        if legal_mask is not None:
+            logits = np.where(legal_mask, logits, -1e9)
+        probs = _softmax(logits)
 
-        # Policy gradient: ∇log π(a) · advantage  + entropy bonus
+        # Policy gradient: ∇log π(a) · advantage  + entropy bonus.
+        # boost_log is a constant offset, so d(logits)/d(params) is unchanged
+        # and the (onehot − π) form stays exact.
         d_pol = -probs.copy()
         d_pol[action] += 1.0
         d_pol *= advantage
-        # Entropy gradient w.r.t. logits: −(log π + 1) shifted by mean,
-        # which simplifies to  −(log π − Σ π·log π)  = −log π + H
         log_probs  = np.log(np.clip(probs, 1e-10, None))
         entropy    = -float((probs * log_probs).sum())
-        d_entropy  = -(log_probs - entropy)          # ∂H/∂logit_i = −(log π_i + 1) + H
+        d_entropy  = -(log_probs - entropy)
         d_pol     += _ENTROPY_COEF * d_entropy
+        if legal_mask is not None:
+            d_pol[~legal_mask] = 0.0      # no gradient through dead logits
 
         # Save pre-update weights for correct trunk backprop
         w_pol_pre = self._pol_w.w.copy()
@@ -175,16 +190,15 @@ class _ACNetwork:
         self._val_b.step(S.NN_VALUE_COEF * d_val_vec, lr, t)
         d_trunk_val = (d_val_vec @ w_val_pre.T).ravel()
 
-        # ── Shared trunk ──────────────────────────────────────────────────────
+        # ── Shared trunk (backprop through PRE-update weights) ────────────────
         delta = d_trunk_pol + d_trunk_val
         for i in reversed(range(len(self._trunk_w))):
             inp   = acts[i]
+            w_pre = self._trunk_w[i].w.copy()
             self._trunk_w[i].step(np.outer(inp, delta), lr, t)
             self._trunk_b[i].step(delta, lr, t)
             if i > 0:
-                w_pre = self._trunk_w[i].w   # already updated — but for ReLU
-                # gate only: use activation, not weight, for ReLU derivative
-                delta = (delta @ self._trunk_w[i].w.T) * (acts[i] > 0).astype(float)
+                delta = (delta @ w_pre.T) * (acts[i] > 0).astype(float)
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -234,11 +248,11 @@ class _ACNetwork:
                     setattr(p, attr, data[key].copy())
 
 
-# ── State encoder (5 channels) ───────────────────────────────────────────────
+# ── State encoder (15 channels) ──────────────────────────────────────────────
 
 def encode_state(board: dict, connections: set,
                  forbidden: set, player: int) -> np.ndarray:
-    """Return a flat float32 vector of length 7 × GRID × GRID.
+    """Return a flat float32 vector of length 15 × GRID × GRID.
 
     Channel 0 : own dots
     Channel 1 : opponent dots
@@ -305,7 +319,7 @@ def encode_state(board: dict, connections: set,
 # ── NNPlayer ─────────────────────────────────────────────────────────────────
 
 class NNPlayer(BasePlayer):
-    """Actor-critic NN player — 5-channel input, Adam, GAE, entropy bonus."""
+    """Actor-critic NN player — 15-channel input, Adam, GAE, entropy bonus."""
 
     def __init__(self, player_id: int):
         self.player_id = player_id
@@ -316,9 +330,9 @@ class NNPlayer(BasePlayer):
             hidden_sizes = self._hidden,
             output_size  = n * n,
         )
-        # trajectory: (enc, action, acts, value_pred)
+        # trajectory: (enc, action, acts, value_pred, boost, legal_mask)
         self._traj:     list = []
-        self._obs_traj: list = []  # opponent-observed steps (enc, action, acts, val)
+        self._obs_traj: list = []  # opponent-observed steps (enc, action, acts, val, boost, legal)
         self.load()
 
     def choose_move(self, board, connections, player, scores,
@@ -336,8 +350,11 @@ class NNPlayer(BasePlayer):
         if not legal_flat.any():
             return (0, 0)
 
-        enc              = encode_state(board, connections, forbidden, player)
-        probs, val, acts = self._net.policy(enc, legal_flat)
+        enc = encode_state(board, connections, forbidden, player)
+        own_scores, opp_scores = opportunity_masks(board, connections, player)
+        boost = boost_log_offsets(own_scores, opp_scores, legal_flat)
+
+        probs, val, acts = self._net.policy(enc, legal_flat, boost)
 
         probs = np.where(np.isfinite(probs), probs, 0.0)
         probs = np.clip(probs, 0.0, None)
@@ -347,12 +364,8 @@ class NNPlayer(BasePlayer):
         else:
             probs = probs / total
 
-        # Boost closing and blocking moves post-policy
-        own_scores, opp_scores = opportunity_masks(board, connections, player)
-        probs = apply_boost(probs, own_scores, opp_scores, legal_flat)
-
         action = int(np.random.choice(n * n, p=probs))
-        self._traj.append((enc, action, acts, val))
+        self._traj.append((enc, action, acts, val, boost, legal_flat))
         return (action % n, action // n)
 
     def record_outcome(self, winner: int,
@@ -393,7 +406,7 @@ class NNPlayer(BasePlayer):
 
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            for t, (enc, action, acts, val) in enumerate(self._traj):
+            for t, (enc, action, acts, val, boost, legal) in enumerate(self._traj):
                 self._net.update(
                     acts          = acts,
                     action        = action,
@@ -401,6 +414,8 @@ class NNPlayer(BasePlayer):
                     value_target  = float(returns[t]),
                     entropy_bonus = _ENTROPY_COEF,
                     lr            = lr,
+                    legal_mask    = legal,
+                    boost_log     = boost,
                 )
             self._traj.clear()
 
@@ -423,7 +438,7 @@ class NNPlayer(BasePlayer):
 
             obs_adv = (obs_adv - obs_adv.mean()) / (obs_adv.std() + 1e-8)
 
-            for t, (enc, action, acts, val) in enumerate(self._obs_traj):
+            for t, (enc, action, acts, val, boost, legal) in enumerate(self._obs_traj):
                 self._net.update(
                     acts          = acts,
                     action        = action,
@@ -431,6 +446,8 @@ class NNPlayer(BasePlayer):
                     value_target  = float(obs_returns[t]),
                     entropy_bonus = _ENTROPY_COEF,
                     lr            = lr,
+                    legal_mask    = legal,
+                    boost_log     = boost,
                 )
             self._obs_traj.clear()
 
@@ -460,10 +477,12 @@ class NNPlayer(BasePlayer):
 
         enc    = encode_state(board, connections, forbidden, player_who_moved)
         action = gy * n + gx
+        own_scores, opp_scores = opportunity_masks(
+            board, connections, player_who_moved)
+        boost = boost_log_offsets(own_scores, opp_scores, legal_mask)
 
-        # Forward pass (no weight update) — get value and activations
-        probs, val, acts = self._net.policy(enc, legal_mask)
-        self._obs_traj.append((enc, action, acts, val))
+        probs, val, acts = self._net.policy(enc, legal_mask, boost)
+        self._obs_traj.append((enc, action, acts, val, boost, legal_mask))
 
     def save(self) -> None:
         path = experience_path(S.NN_EXPERIENCE_BASE, '.npz')
