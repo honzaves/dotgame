@@ -90,33 +90,35 @@ class FastBoard:
                 for gx in range(S.GRID) for gy in range(S.GRID)
                 if (gx, gy) not in occ and (gx, gy) not in self.forbidden]
 
+    def tactical_moves(self, player):
+        """Return (closing, blocking) move lists from ONE opportunity_masks
+        call (each list sorted by score, best first).  closing_moves() and
+        blocking_moves() each previously ran their own O(G²) scan; rollouts
+        call both every step, so sharing the scan ≈ halves the per-step cost."""
+        import ai.features as F
+        own_scores, opp_scores = F.opportunity_masks(
+            self.board, self.connections, player)
+        n = S.GRID
+
+        def _collect(scores):
+            moves = [
+                (int(scores[idx]), idx % n, idx // n)
+                for idx in np.where(scores)[0]
+                if (idx % n, idx // n) not in self.board
+                and (idx % n, idx // n) not in self.forbidden
+            ]
+            moves.sort(reverse=True)
+            return [(gx, gy) for _, gx, gy in moves]
+
+        return _collect(own_scores), _collect(opp_scores)
+
     def closing_moves(self, player):
         """Return legal moves sorted by squares closed (most first)."""
-        from ai.features import opportunity_masks
-        own_scores, _ = opportunity_masks(self.board, self.connections, player)
-        n = S.GRID
-        moves = [
-            (int(own_scores[idx]), idx % n, idx // n)
-            for idx in np.where(own_scores)[0]
-            if (idx % n, idx // n) not in self.board
-            and (idx % n, idx // n) not in self.forbidden
-        ]
-        moves.sort(reverse=True)
-        return [(gx, gy) for _, gx, gy in moves]
+        return self.tactical_moves(player)[0]
 
     def blocking_moves(self, player):
         """Return legal moves sorted by opponent squares blocked (most first)."""
-        from ai.features import opportunity_masks
-        _, opp_scores = opportunity_masks(self.board, self.connections, player)
-        n = S.GRID
-        moves = [
-            (int(opp_scores[idx]), idx % n, idx // n)
-            for idx in np.where(opp_scores)[0]
-            if (idx % n, idx // n) not in self.board
-            and (idx % n, idx // n) not in self.forbidden
-        ]
-        moves.sort(reverse=True)
-        return [(gx, gy) for _, gx, gy in moves]
+        return self.tactical_moves(player)[1]
 
     def adjacent_own(self, player):
         occ = self.board.keys()
@@ -823,8 +825,10 @@ class MCTSPlayer(BasePlayer):
         """Short biased rollout with 6-tier move priority.
 
         Priority order (highest to lowest):
-          1. Fork moves    — creates 2+ simultaneous threats
-          2. Closing moves — complete a unit square right now (certain points)
+          1. Closing moves — complete a unit square right now (certain points)
+          2. Fork moves    — creates 2+ simultaneous threats (only checked when
+                             there is no closing move, avoiding an O(G²·4) scan
+                             on the most common rollout step)
           3. Blocking moves— stop opponent completing a unit square
           4. Setup moves   — creates a 3-own-corner unit square (next-turn threat)
                              This tier is critical for MCTS vs MCTS: without it,
@@ -834,6 +838,10 @@ class MCTSPlayer(BasePlayer):
           5. Adjacent-own  — extend own dot cluster (50% bias, reduced from 75%
                              so rollouts stay exploratory and territory can emerge)
           6. Random legal
+
+        closing and blocking share a single opportunity_masks call via
+        tactical_moves(); fork_moves() (O(G²·4)) is only called when there
+        is no closing move, roughly halving per-step compute in most positions.
         """
         sim   = fb.copy()
         depth = 0
@@ -843,27 +851,27 @@ class MCTSPlayer(BasePlayer):
             if not legal:
                 break
 
-            closing  = sim.closing_moves(p)
-            blocking = sim.blocking_moves(p)
-            forks    = sim.fork_moves(p)
+            closing, blocking = sim.tactical_moves(p)
 
-            if forks and not closing:
-                move = random.choice(forks)
-            elif closing:
+            if closing:
                 move = closing[0]
-            elif blocking:
-                move = blocking[0]
             else:
-                setup = sim.setup_moves(p)
-                adj   = sim.adjacent_own(p)
-                if setup:
-                    # Prefer creating a territory threat over plain line extension
-                    move = random.choice(setup)
-                elif adj and random.random() < 0.50:
-                    # Reduced from 0.75 — lower bias keeps rollouts exploratory
-                    move = random.choice(adj)
+                forks = sim.fork_moves(p)
+                if forks:
+                    move = random.choice(forks)
+                elif blocking:
+                    move = blocking[0]
                 else:
-                    move = random.choice(legal)
+                    setup = sim.setup_moves(p)
+                    adj   = sim.adjacent_own(p)
+                    if setup:
+                        # Prefer creating a territory threat over plain line extension
+                        move = random.choice(setup)
+                    elif adj and random.random() < 0.50:
+                        # Reduced from 0.75 — lower bias keeps rollouts exploratory
+                        move = random.choice(adj)
+                    else:
+                        move = random.choice(legal)
 
             sim.play(*move)
             depth += 1

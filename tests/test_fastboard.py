@@ -373,3 +373,29 @@ class TestUpdateScoresFast:
         fb._update_scores_fast(1, 1, 1)
         # cell(0,0) closed (all four P1) + cell(1,0) closed (all four P1) = 2.0
         assert fb.scores[1] == 2.0
+
+
+# ── tactical_moves() ─────────────────────────────────────────────────────────
+
+class TestTacticalMoves:
+    def test_matches_closing_and_blocking(self):
+        board = {(0, 0): 1, (1, 0): 1, (0, 1): 1,      # P1 3-corner square
+                 (5, 5): 2, (6, 5): 2, (5, 6): 2}      # P2 3-corner square
+        fb = fb_with(board)
+        closing, blocking = fb.tactical_moves(1)
+        assert closing == fb.closing_moves(1)
+        assert blocking == fb.blocking_moves(1)
+        assert (1, 1) in closing
+        assert (6, 6) in blocking
+
+    def test_single_opportunity_masks_call(self, monkeypatch):
+        import ai.features as F
+        calls = {'n': 0}
+        real = F.opportunity_masks
+        def counting(*a, **kw):
+            calls['n'] += 1
+            return real(*a, **kw)
+        monkeypatch.setattr(F, 'opportunity_masks', counting)
+        fb = fb_with({(0, 0): 1, (1, 0): 1, (0, 1): 1})
+        fb.tactical_moves(1)
+        assert calls['n'] == 1
