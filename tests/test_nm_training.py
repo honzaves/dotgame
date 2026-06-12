@@ -47,3 +47,37 @@ class TestBufferTraining:
             _fake_episode(p, steps=2)
             p.record_outcome(1, final_scores={1: 5.0, 2: 1.0})
         assert len(p._buffer) == 4
+
+
+class TestTreeReuse:
+    def _node(self, move, parent, who):
+        from ai.neural_mcts_player import _NMNode
+        return _NMNode(move=move, parent=parent, children=None,
+                       player_who_moved=who)
+
+    def test_promotes_matching_grandchild(self):
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        # Hand-built saved subtree: our chosen move (2,2), opponent replies
+        chosen = self._node((2, 2), None, 1)
+        chosen.children = [self._node((3, 3), chosen, 2),
+                           self._node((4, 4), chosen, 2)]
+        chosen.children[0].visits = 7
+        p._saved_root  = chosen
+        p._saved_board = {(2, 2): 1}
+        new_root = p._try_reuse_tree({(2, 2): 1, (3, 3): 2})
+        assert new_root is chosen.children[0]
+        assert new_root.visits == 7
+        assert p._saved_root is None        # state cleared after reuse
+
+    def test_discards_on_removed_dots(self):
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p._saved_root  = self._node((2, 2), None, 1)
+        p._saved_board = {(2, 2): 1, (5, 5): 2}
+        assert p._try_reuse_tree({(2, 2): 1, (0, 0): 2}) is None
+
+    def test_choose_move_saves_subtree(self):
+        S.AI_THINK_MS = 30
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p.choose_move({}, set(), 1, {1: 0.0, 2: 0.0}, set())
+        assert p._saved_root is not None
+        assert p._saved_board is not None

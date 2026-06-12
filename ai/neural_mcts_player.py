@@ -32,6 +32,14 @@ Architecture
   No PPO needed — the policy target is a stable supervised signal from the tree,
   not a self-bootstrapped value estimate.
 
+Tree reuse
+  After each turn the chosen child's subtree is saved.  On the next turn its
+  grandchild matching the opponent's reply is promoted to root, inheriting all
+  accumulated visit counts.  Root priors are refreshed from the current network
+  call (including the fresh tactical boost and Dirichlet noise) so the reused
+  subtree still benefits from this turn's evaluation.  Children missing from
+  last turn's expansion are added with 0 visits and fresh priors.
+
 Requirements: pip install torch
 """
 
@@ -120,6 +128,13 @@ class NeuralMCTSPlayer(BasePlayer):
         position evaluation, allowing far more tree nodes per second.
       - Training on MCTS visit distributions causes the network to learn
         *what the tree found*, not just what the network originally guessed.
+
+    Tree reuse: the chosen child's subtree is kept between turns.  On the
+    next call to choose_move, _try_reuse_tree promotes the grandchild that
+    matches the opponent's actual reply, so the previous search is not wasted.
+    Priors for all surviving children are refreshed from the new root network
+    call (tactical boost + Dirichlet noise applied as normal).  Reuse is
+    discarded on encirclement (dots removed) or any unexpected board diff.
     """
 
     def __init__(self, player_id: int):
@@ -147,6 +162,12 @@ class NeuralMCTSPlayer(BasePlayer):
         # AlphaZero training store.  In-memory only; cleared on restart.
         self._buffer: list[tuple] = []
         self._learning_shared: bool = False
+
+        # Tree reuse: subtree of the move we chose last turn + the board we
+        # expected after playing it (used to diff out the opponent's reply).
+        self._saved_root:  '_NMNode | None' = None
+        self._saved_board: dict | None      = None
+
         self.load()
 
     # ── BasePlayer interface ──────────────────────────────────────────────────
@@ -182,6 +203,7 @@ class NeuralMCTSPlayer(BasePlayer):
 
         if len(legal) == 1:
             # Only one move — record and return immediately (no search needed)
+            self._discard_tree()
             visit_dist = np.zeros(n * n, dtype=np.float32)
             gx, gy = legal[0]
             visit_dist[gy * n + gx] = 1.0
@@ -219,15 +241,36 @@ class NeuralMCTSPlayer(BasePlayer):
         # AlphaZero-style: children already exist with priors from root network
         # call.  On the first simulation each child immediately gets expanded
         # (another network call) to populate its own children.
-        root = _NMNode(move=None, parent=None, children=[],
-                       player_who_moved=3 - player, prior=0.0)
-        for gx, gy in legal:
-            child = _NMNode(
-                move=(gx, gy), parent=root, children=None,
-                player_who_moved=player,              # player moved to reach child
-                prior=float(root_priors[gy * n + gx])
-            )
-            root.children.append(child)
+        # If we can reuse a subtree from the previous turn (grandchild matching
+        # the opponent's reply), we inherit its visit counts and only refresh
+        # the priors with this turn's network output + tactical boost + noise.
+        reused = self._try_reuse_tree(board)
+        if reused is not None and reused.children:
+            # Inherit the searched subtree; refresh priors from THIS turn's
+            # root evaluation (tactical boost + fresh Dirichlet noise) and
+            # add children for any move that wasn't expanded last turn.
+            root = reused
+            root.move = None
+            legal_set = set(legal)
+            root.children = [c for c in root.children if c.move in legal_set]
+            have = {c.move for c in root.children}
+            for c in root.children:
+                gx, gy = c.move
+                c.prior = float(root_priors[gy * n + gx])
+            for gx, gy in legal:
+                if (gx, gy) not in have:
+                    root.children.append(_NMNode(
+                        move=(gx, gy), parent=root, children=None,
+                        player_who_moved=player,
+                        prior=float(root_priors[gy * n + gx])))
+        else:
+            root = _NMNode(move=None, parent=None, children=[],
+                           player_who_moved=3 - player, prior=0.0)
+            for gx, gy in legal:
+                root.children.append(_NMNode(
+                    move=(gx, gy), parent=root, children=None,
+                    player_who_moved=player,
+                    prior=float(root_priors[gy * n + gx])))
 
         # ── MCTS simulations ──────────────────────────────────────────────────
         deadline = time.time() + S.AI_THINK_MS / 1000.0
@@ -268,11 +311,19 @@ class NeuralMCTSPlayer(BasePlayer):
         # After many simulations visit counts are much more reliable than
         # a single network query, so we always use argmax(visits).
         best = max(root.children, key=lambda c: c.visits)
+
+        # Save the chosen subtree for next turn's reuse
+        best.parent = None
+        self._saved_root = best
+        fb2 = fb.copy(); fb2.play(*best.move)
+        self._saved_board = dict(fb2.board)
+
         return best.move
 
     def record_outcome(self, winner: int,
                        intermediate_rewards=None,
                        final_scores: dict | None = None) -> None:
+        self._discard_tree()   # game ended — saved subtree is stale
         if not self._episode and not self._obs_episode:
             return
 
@@ -461,6 +512,38 @@ class NeuralMCTSPlayer(BasePlayer):
             pass
 
     # ── Internal MCTS helpers ─────────────────────────────────────────────────
+
+    def _discard_tree(self) -> None:
+        """Clear any saved subtree (called on game end or unexpected board diff)."""
+        self._saved_root  = None
+        self._saved_board = None
+
+    def _try_reuse_tree(self, current_board: dict) -> '_NMNode | None':
+        """Promote the grandchild matching the opponent's actual reply.
+
+        Returns the new root (with inherited visit counts) or None.  Discards
+        on encirclement (dots removed) or any unexpected board diff — same
+        policy as MCTSPlayer._try_reuse_tree.
+        """
+        if self._saved_root is None or self._saved_board is None:
+            return None
+        prev = self._saved_board
+        if any(pos not in current_board for pos in prev):
+            self._discard_tree()
+            return None
+        new_dots = [pos for pos in current_board if pos not in prev]
+        if len(new_dots) != 1:
+            self._discard_tree()
+            return None
+        opp_move = new_dots[0]
+        node = self._saved_root
+        self._discard_tree()
+        if node.children:
+            for child in node.children:
+                if child.move == opp_move:
+                    child.parent = None
+                    return child
+        return None
 
     def _select(self, root: _NMNode, fb) -> tuple:
         """Descend tree following PUCT until an unvisited (children=None) node."""
