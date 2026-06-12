@@ -32,6 +32,25 @@ class TestMaskedPolicyGradient:
         assert probs2[~legal].sum() < 1e-6
         assert probs2[2] > probs[2]          # advantage pushed the action up
 
+    def test_update_gradient_is_zero_at_illegal_columns(self):
+        net = _ACNetwork(15 * S.GRID * S.GRID, [16], S.GRID * S.GRID)
+        x = np.random.default_rng(3).normal(size=15 * S.GRID * S.GRID)
+        legal = np.zeros(S.GRID * S.GRID, dtype=bool)
+        legal[:5] = True
+        _, _, acts = net.policy(x, legal)
+        w_before = net._pol_w.w.copy()
+        b_before = net._pol_b.w.copy()
+        net.update(acts, action=1, advantage=1.0, value_target=0.5,
+                   entropy_bonus=0.01, lr=0.01,
+                   legal_mask=legal, boost_log=None)
+        # Policy-head columns of ILLEGAL positions must not move at all:
+        # their gradient is exactly zeroed, so Adam (zero-initialised moments)
+        # produces a zero step for them.
+        assert np.allclose(net._pol_w.w[:, ~legal], w_before[:, ~legal])
+        assert np.allclose(net._pol_b.w[~legal], b_before[~legal])
+        # Legal columns DO move (sanity that the update isn't a no-op).
+        assert not np.allclose(net._pol_w.w[:, legal], w_before[:, legal])
+
 
 class TestTrajectoryCarriesMaskAndBoost:
     def test_choose_move_stores_six_tuple(self):
