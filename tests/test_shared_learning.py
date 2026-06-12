@@ -55,3 +55,4 @@ class TestTorchSharing:
         p2 = NeuralMCTSPlayer(2); p2.save = lambda: None
         p1.share_learning_with(p2)
         assert p2._net is p1._net and p2._opt is p1._opt
+        assert p2._buffer is p1._buffer

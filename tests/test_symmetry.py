@@ -37,3 +37,17 @@ class TestCanonicalKey:
     def test_distinguishes_different_positions(self):
         assert (canonical_board_key({(1, 2): 1})
                 != canonical_board_key({(1, 2): 2}))
+
+
+class TestD4Closure:
+    def test_canonical_key_invariant_under_all_eight_point_maps(self):
+        from ai.symmetry import point_transforms, canonical_board_key
+        n = S.GRID
+        rng = np.random.default_rng(7)
+        for _ in range(5):
+            cells = rng.choice(n * n, size=12, replace=False)
+            board = {(int(c % n), int(c // n)): int(1 + (c % 2)) for c in cells}
+            base = canonical_board_key(board)
+            for t in point_transforms(n):
+                tb = {t(gx, gy): p for (gx, gy), p in board.items()}
+                assert canonical_board_key(tb) == base

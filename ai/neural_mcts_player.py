@@ -45,6 +45,7 @@ import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
 from ai.features import opportunity_masks, arc_potential_map, adaptive_dirichlet_alpha
+from ai.symmetry import transform_planes, transform_flat, N_TRANSFORMS
 
 _TORCH_AVAILABLE = False
 try:
@@ -142,6 +143,9 @@ class NeuralMCTSPlayer(BasePlayer):
         # Observed opponent moves — same tuple format but encoded from the
         # opponent's perspective; trained with inverted terminal value.
         self._obs_episode: list[tuple] = []
+        # Replay buffer of (enc, legal_mask, visit_dist, value_target) — the
+        # AlphaZero training store.  In-memory only; cleared on restart.
+        self._buffer: list[tuple] = []
         self._learning_shared: bool = False
         self.load()
 
@@ -269,10 +273,8 @@ class NeuralMCTSPlayer(BasePlayer):
     def record_outcome(self, winner: int,
                        intermediate_rewards=None,
                        final_scores: dict | None = None) -> None:
-        if not self._episode:
+        if not self._episode and not self._obs_episode:
             return
-
-        T = len(self._episode)
 
         # ── Terminal value in [-1, 1] ─────────────────────────────────────────
         if final_scores and winner != 0:
@@ -284,146 +286,112 @@ class NeuralMCTSPlayer(BasePlayer):
             terminal = (1.0 if winner == self.player_id else
                        -1.0 if winner != 0               else 0.0)
 
-        shape = (list(intermediate_rewards)
-                 if intermediate_rewards and len(intermediate_rewards) == T
-                 else [0.0] * T)
+        # ── Append episodes to the replay buffer ─────────────────────────────
+        if self._episode:
+            targets = self._value_targets(
+                [t[3] for t in self._episode], intermediate_rewards, terminal)
+            for (enc, mask, dist, _), tgt in zip(self._episode, targets):
+                self._buffer.append((enc, mask, dist, float(tgt)))
+            self._episode.clear()
 
-        # ── GAE (same formula as PyTorchPlayer) ───────────────────────────────
-        γ, λ  = S.NM_DISCOUNT, S.NM_GAE_LAMBDA
-        vals  = [t[3] for t in self._episode]          # root value predictions
-        vnext = vals[1:] + [terminal]
-
-        advantages = np.zeros(T, dtype=np.float32)
-        gae = 0.0
-        for t in reversed(range(T)):
-            delta         = shape[t] + γ * vnext[t] - vals[t]
-            gae           = delta + γ * λ * gae
-            advantages[t] = gae
-
-        returns_np = advantages + np.array(vals, dtype=np.float32)
-
-        # returns_np is already computed; advantages are not used further in NM
-        # (there is no PPO ratio — policy is trained on CE against visit dist).
-
-        # ── Build tensors ─────────────────────────────────────────────────────
-        states_t  = torch.tensor(
-            np.stack([t[0] for t in self._episode]),
-            dtype=torch.float32, device=self._device)           # (T, 15, G, G)
-        masks_t   = torch.tensor(
-            np.stack([t[1] for t in self._episode]),
-            dtype=torch.bool, device=self._device)              # (T, G²)
-        pi_mcts_t = torch.tensor(
-            np.stack([t[2] for t in self._episode]),
-            dtype=torch.float32, device=self._device)           # (T, G²)  visit dist
-        ret_t     = torch.tensor(returns_np,
-                                 dtype=torch.float32, device=self._device)  # (T,)
-
-        # ── Single gradient update ────────────────────────────────────────────
-        # AlphaZero does not use PPO: the policy target (MCTS visit distribution)
-        # is an external supervised signal, not a self-bootstrapped estimate.
-        # One Adam step per game is stable and correct.
-        logits, vals_pred = self._net(states_t)
-        logits_m = logits.clone()
-        logits_m[~masks_t] = float('-inf')
-        log_probs = F.log_softmax(logits_m, dim=1)      # (T, G²)
-        probs     = log_probs.exp()
-
-        # Cross-entropy: teach the network to replicate what the tree found.
-        # Illegal positions have log_probs = -inf and pi_mcts_t = 0.0, but
-        # 0.0 * -inf = nan in IEEE 754, which would poison the entire loss.
-        # Zero out log_probs at illegal positions before the dot product —
-        # those positions contribute 0 to the sum anyway.
-        safe_log_probs = log_probs.clone()
-        safe_log_probs[~masks_t] = 0.0
-        pol_loss = -(pi_mcts_t * safe_log_probs).sum(dim=1).mean()
-
-        # MSE: teach the network to predict what the return will be
-        val_loss = F.mse_loss(vals_pred, ret_t)
-
-        # Entropy over legal positions only.  Illegal positions already have
-        # probs=0 from the masked softmax, but we zero log_probs there too
-        # so the product is 0*0=0 (not 0*(-inf)=nan) and the gradient for
-        # near-zero-probability LEGAL moves is never accidentally suppressed.
-        legal_log_p = torch.where(masks_t, log_probs, torch.zeros_like(log_probs))
-        entropy     = -(probs * legal_log_p).sum(dim=1).mean()
-
-        loss = (S.NM_POLICY_COEF  * pol_loss
-                + S.NM_VALUE_COEF * val_loss
-                - S.NM_ENTROPY_COEF * entropy)
-
-        self._opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self._net.parameters(), S.PT_MAX_GRAD_NORM)
-        self._opt.step()
-
-        self._episode.clear()
-
-        # ── Train on observed opponent moves (symmetric self-play) ────────────
         if self._obs_episode:
-            T_obs = len(self._obs_episode)
-            # Opponent's terminal is the inverse of ours.
-            obs_terminal = -terminal
+            # Opponent's perspective: inverted terminal, no shaping rewards.
+            obs_targets = self._value_targets(
+                [t[3] for t in self._obs_episode], None, -terminal)
+            for (enc, mask, dist, _), tgt in zip(self._obs_episode, obs_targets):
+                self._buffer.append((enc, mask, dist, float(tgt)))
+            self._obs_episode.clear()
 
-            # GAE with no shaping (we don't have opponent's intermediate rewards)
-            obs_vals  = [t[3] for t in self._obs_episode]
-            obs_vnext = obs_vals[1:] + [obs_terminal]
+        if len(self._buffer) > S.NM_BUFFER_MAX:
+            del self._buffer[:len(self._buffer) - S.NM_BUFFER_MAX]
 
-            obs_advantages = np.zeros(T_obs, dtype=np.float32)
-            gae = 0.0
-            for t in reversed(range(T_obs)):
-                delta          = γ * obs_vnext[t] - obs_vals[t]
-                gae            = delta + γ * λ * gae
-                obs_advantages[t] = gae
+        self._train_from_buffer()
+        self.save()
 
-            obs_returns = obs_advantages + np.array(obs_vals, dtype=np.float32)
+    def _value_targets(self, vals: list, shape, terminal: float) -> np.ndarray:
+        """Per-step value targets: GAE returns blended with the final outcome.
 
-            # obs_advantages not used further; obs_returns feeds the value loss.
+        Pure GAE bootstraps through the network's own (initially wrong) value
+        estimates; pure z (AlphaZero) ignores shaping.  The NM_Z_WEIGHT blend
+        gives early ring-building moves direct credit for the final margin
+        while keeping the dense shaping signal.
+        """
+        T = len(vals)
+        shape = list(shape) if (shape and len(shape) == T) else [0.0] * T
+        γ, λ  = S.NM_DISCOUNT, S.NM_GAE_LAMBDA
+        vnext = vals[1:] + [terminal]
+        adv   = np.zeros(T, dtype=np.float32)
+        gae   = 0.0
+        for t in reversed(range(T)):
+            delta  = shape[t] + γ * vnext[t] - vals[t]
+            gae    = delta + γ * λ * gae
+            adv[t] = gae
+        returns = adv + np.array(vals, dtype=np.float32)
+        w = S.NM_Z_WEIGHT
+        return np.clip((1.0 - w) * returns + w * float(terminal), -1.0, 1.0)
 
-            obs_states_t = torch.tensor(
-                np.stack([t[0] for t in self._obs_episode]),
-                dtype=torch.float32, device=self._device)
-            obs_masks_t  = torch.tensor(
-                np.stack([t[1] for t in self._obs_episode]),
-                dtype=torch.bool, device=self._device)
-            obs_pi_t     = torch.tensor(
-                np.stack([t[2] for t in self._obs_episode]),
-                dtype=torch.float32, device=self._device)
-            obs_ret_t    = torch.tensor(
-                obs_returns, dtype=torch.float32, device=self._device)
+    def _train_from_buffer(self) -> None:
+        """Sample NM_TRAIN_STEPS minibatches from the replay buffer and take
+        one Adam step each.  Each sampled item gets a random D4 transform
+        (policy target and mask transformed identically; value is invariant)."""
+        if not self._buffer:
+            return
+        n_steps = (S.NM_TRAIN_STEPS
+                   if len(self._buffer) >= S.NM_BATCH_SIZE else 1)
+        for _ in range(n_steps):
+            k   = min(S.NM_BATCH_SIZE, len(self._buffer))
+            idx = np.random.choice(len(self._buffer), size=k, replace=False)
+            encs, masks, dists, tgts = [], [], [], []
+            for i in idx:
+                enc, mask, dist, tgt = self._buffer[i]
+                if S.NM_AUGMENT:
+                    op   = int(np.random.randint(N_TRANSFORMS))
+                    enc  = transform_planes(enc, op)
+                    mask = transform_flat(
+                        mask.astype(np.float32), op) > 0.5
+                    dist = transform_flat(dist, op)
+                encs.append(enc); masks.append(mask)
+                dists.append(dist); tgts.append(tgt)
 
-            obs_logits, obs_vals_pred = self._net(obs_states_t)
-            obs_logits_m = obs_logits.clone()
-            obs_logits_m[~obs_masks_t] = float('-inf')
-            obs_log_probs = F.log_softmax(obs_logits_m, dim=1)
-            obs_probs     = obs_log_probs.exp()
+            states_t = torch.tensor(np.stack(encs), dtype=torch.float32,
+                                    device=self._device)
+            masks_t  = torch.tensor(np.stack(masks), dtype=torch.bool,
+                                    device=self._device)
+            pi_t     = torch.tensor(np.stack(dists), dtype=torch.float32,
+                                    device=self._device)
+            ret_t    = torch.tensor(np.array(tgts, dtype=np.float32),
+                                    device=self._device)
 
-            obs_safe_lp = obs_log_probs.clone()
-            obs_safe_lp[~obs_masks_t] = 0.0
+            logits, vals_pred = self._net(states_t)
+            logits_m = logits.clone()
+            logits_m[~masks_t] = float('-inf')
+            log_probs = F.log_softmax(logits_m, dim=1)
+            probs     = log_probs.exp()
 
-            obs_pol_loss  = -(obs_pi_t * obs_safe_lp).sum(dim=1).mean()
-            obs_val_loss  = F.mse_loss(obs_vals_pred, obs_ret_t)
-            obs_legal_lp  = torch.where(obs_masks_t, obs_log_probs,
-                                        torch.zeros_like(obs_log_probs))
-            obs_entropy   = -(obs_probs * obs_legal_lp).sum(dim=1).mean()
+            # 0 * -inf = nan — zero illegal log-probs before the dot product.
+            safe_lp = log_probs.clone()
+            safe_lp[~masks_t] = 0.0
+            pol_loss = -(pi_t * safe_lp).sum(dim=1).mean()
+            val_loss = F.mse_loss(vals_pred, ret_t)
+            legal_lp = torch.where(masks_t, log_probs,
+                                   torch.zeros_like(log_probs))
+            entropy  = -(probs * legal_lp).sum(dim=1).mean()
 
-            obs_loss = (S.NM_POLICY_COEF   * obs_pol_loss
-                        + S.NM_VALUE_COEF  * obs_val_loss
-                        - S.NM_ENTROPY_COEF * obs_entropy)
+            loss = (S.NM_POLICY_COEF   * pol_loss
+                    + S.NM_VALUE_COEF  * val_loss
+                    - S.NM_ENTROPY_COEF * entropy)
 
             self._opt.zero_grad()
-            obs_loss.backward()
+            loss.backward()
             nn.utils.clip_grad_norm_(self._net.parameters(), S.PT_MAX_GRAD_NORM)
             self._opt.step()
 
-            self._obs_episode.clear()
-
-        self.save()
-
     def share_learning_with(self, other: 'NeuralMCTSPlayer') -> None:
         """Make *other* train and act with this player's network/optimizer."""
-        other._net  = self._net
-        other._opt  = self._opt
-        other._arch = self._arch
+        other._net    = self._net
+        other._opt    = self._opt
+        other._arch   = self._arch
+        other._buffer = self._buffer
         self._learning_shared = other._learning_shared = True
 
     def observe_opponent_move(self, board, connections, player_who_moved,

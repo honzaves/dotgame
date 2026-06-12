@@ -193,6 +193,12 @@ NM_NOISE_ALPHA      = 0.3              # Dirichlet noise concentration at root
 NM_NOISE_FRAC       = 0.25             # fraction of root prior that comes from noise
 NM_DEAD_SPOT_PENALTY = 5.0             # divide prior of positions with zero territorial potential
 
+NM_BUFFER_MAX       = 8000             # max (state, π, v) samples kept in memory
+NM_BATCH_SIZE       = 256              # minibatch size per training step
+NM_TRAIN_STEPS      = 4                # minibatches sampled per finished game
+NM_Z_WEIGHT         = 0.5             # blend of final outcome z into value target
+NM_AUGMENT          = True             # random D4 transform per sampled item
+
 NM_OVERRIDE         = None             # override architecture: {'blocks':4,'channels':64}
 
 def nm_arch():
