@@ -37,6 +37,7 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
+from ai.symmetry import canonical_board_key
 from ai.features import (opportunity_masks, apply_boost,
                           enclosure_potential, enclosure_scalars,
                           arc_potential_scalars, arc_potential_map,
@@ -653,7 +654,7 @@ class MCTSPlayer(BasePlayer):
                 if new_board.get(nb) == player_who_moved:
                     new_conn.add(frozenset({(gx, gy), nb}))
         # Build the board key directly (same format as _board_key)
-        key = str(sorted((bx, by, p) for (bx, by), p in new_board.items()))
+        key = canonical_board_key(new_board)
         self._obs_moves.append(key)
 
     def share_learning_with(self, other: 'MCTSPlayer') -> None:
@@ -778,7 +779,7 @@ class MCTSPlayer(BasePlayer):
 
     @staticmethod
     def _board_key(fb: FastBoard) -> str:
-        return str(sorted((gx, gy, p) for (gx, gy), p in fb.board.items()))
+        return canonical_board_key(fb.board)
 
     def _warm_start(self, root: _Node, fb: FastBoard) -> None:
         key = self._board_key(fb)
