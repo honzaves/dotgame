@@ -447,8 +447,10 @@ now implement `share_learning_with(other)`:
 The method sets `_learning_shared = True` on **both** sides, and every concrete
 `observe_opponent_move` starts with `if self._learning_shared: return` — with one shared
 net/dict, the partner's own-move training already covers those positions; recording both would
-double-count. Wired in `dotgame._make_runners` (same-type, non-human pairs) and in both
-train-screen player builders (when `resolved_opp == ai_label`).
+double-count. Wired in `dotgame._make_runners` (same-type, non-human pairs) and in the START
+train-screen branch (when `resolved_opp == ai_label`). The REPLAY branch deliberately does NOT
+link the pair — replay learning flows entirely through observe_opponent_move, which the sharing
+gate would silence.
 
 ---
 

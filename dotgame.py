@@ -495,8 +495,11 @@ def main():
                                     training_mode = False
                                     picking_mode  = True
                                 else:
-                                    if resolved_opp == ai_label:
-                                        rp1.share_learning_with(rp2)
+                                    # NOTE: replay players are deliberately NOT
+                                    # linked via share_learning_with() — replay
+                                    # learning flows entirely through
+                                    # observe_opponent_move, which the sharing
+                                    # gate would silence on both sides.
                                     n_repeats  = _TRAIN_ROUND_PRESETS[train_rnd_idx]
                                     n_games    = count_games()
                                     total_reps = n_games * n_repeats
