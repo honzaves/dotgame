@@ -47,3 +47,42 @@ class TestPTBoostConsistency:
         logits[~torch.tensor(mask)] = float('-inf')
         log_p = torch.log_softmax(logits, dim=0)
         assert abs(float(log_p[action]) - lp_old) < 1e-5
+
+
+class TestPTTrainingStaysFinite:
+    def _fake_traj(self, p, steps=3):
+        import numpy as np
+        n = S.GRID
+        for i in range(steps):
+            enc   = np.random.default_rng(i).normal(
+                size=(15, n, n)).astype(np.float32)
+            mask  = np.zeros(n * n, dtype=bool); mask[: n * n // 2] = True
+            boost = np.zeros(n * n, dtype=np.float32)
+            p._traj.append((enc, mask, i, -2.0, 0.1, boost))
+
+    def test_record_outcome_keeps_parameters_finite(self):
+        import numpy as np
+        from ai.pytorch_player import PyTorchPlayer
+        p = PyTorchPlayer(player_id=1)
+        p.save = lambda: None
+        self._fake_traj(p, steps=3)
+        p.record_outcome(1, intermediate_rewards=[0.0, 0.1, 0.0],
+                         final_scores={1: 10.0, 2: 2.0})
+        assert p._traj == []
+        assert all(torch.isfinite(q).all() for q in p._net.parameters())
+
+    def test_observed_moves_training_keeps_parameters_finite(self):
+        import numpy as np
+        n = S.GRID
+        from ai.pytorch_player import PyTorchPlayer
+        p = PyTorchPlayer(player_id=1)
+        p.save = lambda: None
+        for i in range(3):
+            enc   = np.random.default_rng(10 + i).normal(
+                size=(15, n, n)).astype(np.float32)
+            mask  = np.zeros(n * n, dtype=bool); mask[: n * n // 2] = True
+            boost = np.zeros(n * n, dtype=np.float32)
+            p._obs_traj.append((enc, mask, i, -2.0, 0.1, boost))
+        p.record_outcome(2, final_scores={1: 2.0, 2: 10.0})
+        assert p._obs_traj == []
+        assert all(torch.isfinite(q).all() for q in p._net.parameters())
