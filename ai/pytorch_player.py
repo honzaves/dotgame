@@ -330,6 +330,9 @@ class PyTorchPlayer(BasePlayer):
 
                     val_loss = F.mse_loss(vals_pred, b_ret)
 
+                    # Entropy is intentionally measured on the BOOSTED policy
+                    # (logits + boost offsets) — the distribution actions are
+                    # actually sampled from. Do not "fix" this to raw logits.
                     probs_all = log_p_all.exp()
                     entropy   = -(probs_all * log_p_all).sum(dim=1).mean()
 
@@ -424,6 +427,9 @@ class PyTorchPlayer(BasePlayer):
                     surr2    = torch.clamp(ratio, 1 - clip, 1 + clip) * b_adv
                     pol_loss = -torch.min(surr1, surr2).mean()
                     val_loss = F.mse_loss(vals_pred, b_ret)
+                    # Entropy is intentionally measured on the BOOSTED policy
+                    # (logits + boost offsets) — the distribution actions are
+                    # actually sampled from. Do not "fix" this to raw logits.
                     probs_all = log_p_all.exp()
                     entropy   = -(probs_all * log_p_all).sum(dim=1).mean()
 
