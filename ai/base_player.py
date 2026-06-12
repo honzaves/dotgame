@@ -51,8 +51,13 @@ class BasePlayer(ABC):
         Default is a no-op (human players, base class).
         """
 
-    def record_outcome(self, winner: int, intermediate_rewards=None) -> None:
-        """Called once the game ends.  Use to back-propagate the result."""
+    def record_outcome(self, winner: int, intermediate_rewards=None,
+                       final_scores: dict | None = None) -> None:
+        """Called once the game ends.  Use to back-propagate the result.
+
+        winner: 1/2, 0 (draw/unknown from Trainer) or None (draw, live game).
+        final_scores: {1: float, 2: float} territory scores at game end.
+        """
 
     def save(self) -> None:
         """Persist learned experience to disk."""

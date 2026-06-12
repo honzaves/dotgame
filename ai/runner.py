@@ -85,19 +85,6 @@ class AIRunner:
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
 
-    def observe_opponent_move(self, board: dict, connections: set,
-                              player_who_moved: int, move: tuple,
-                              forbidden=None) -> None:
-        """Let the AI observe the board state that resulted from the opponent's move.
-
-        Called immediately after the other player places a dot, before this
-        player's own think cycle begins.  Runs synchronously (cheap — no tree
-        search) so it can safely share the main-thread board snapshot.
-        """
-        if hasattr(self._player, 'observe_opponent_move'):
-            self._player.observe_opponent_move(
-                board, connections, player_who_moved, move, forbidden)
-
     def on_game_end(self, winner: int, final_scores: dict | None = None) -> None:
         """Forward outcome to the underlying player for learning."""
         self._player.record_outcome(winner, final_scores=final_scores)
