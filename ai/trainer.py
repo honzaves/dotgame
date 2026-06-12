@@ -297,19 +297,11 @@ class Trainer:
                 move_scores[cp].append(shaping)
 
                 # Symmetric learning: let the OTHER player observe this move
-                # from their own perspective.  Doubles training data and
-                # teaches each player to recognise strong/weak opponent play.
+                # from their own perspective, using the PRE-move snapshots.
+                # (Passing the post-move board corrupts training: the action's
+                # position would be occupied → masked → log_prob = -inf.)
                 players[3 - cp].observe_opponent_move(
                     board_snap, conn_snap, cp, move, forbidden_snap)
-
-                # Let the OTHER player observe the resulting board position.
-                # They learn: "this board (created by the opponent's move) had
-                # this eventual outcome from my perspective."
-                opp = players[3 - cp]
-                if hasattr(opp, 'observe_opponent_move'):
-                    opp.observe_opponent_move(
-                        dict(game.board), set(game.connections),
-                        cp, move, set(game.forbidden))
 
             winner = game.winner   # None = draw, 1 or 2 = winner
             if winner:
