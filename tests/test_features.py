@@ -496,3 +496,36 @@ class TestStrategicChannels:
     def test_all_arrays_correct_length(self):
         for arr in strategic_channels({}, set(), 1, 0):
             assert len(arr) == N * N
+
+
+# ── boost_log_offsets() ───────────────────────────────────────────────────────
+
+class TestBoostLogOffsets:
+    def test_equivalent_to_apply_boost(self):
+        import numpy as np
+        from ai.features import apply_boost, boost_log_offsets
+        n = S.GRID
+        rng = np.random.default_rng(42)
+        logits = rng.normal(size=n * n)
+        own = np.zeros(n * n, dtype=np.float32); own[5]  = 1.0; own[17] = 0.5
+        opp = np.zeros(n * n, dtype=np.float32); opp[5]  = 0.5; opp[30] = 1.0
+        legal = np.ones(n * n, dtype=bool); legal[2] = False
+
+        masked = np.where(legal, logits, -1e9)
+        probs  = np.exp(masked - masked.max()); probs /= probs.sum()
+        expected = apply_boost(probs, own, opp, legal)
+
+        off = boost_log_offsets(own, opp, legal)
+        boosted = np.where(legal, logits + off, -1e9)
+        got = np.exp(boosted - boosted.max()); got /= got.sum()
+
+        assert np.allclose(got, expected, atol=1e-9)
+
+    def test_zero_at_illegal_positions(self):
+        import numpy as np
+        from ai.features import boost_log_offsets
+        n = S.GRID
+        own = np.ones(n * n, dtype=np.float32)
+        opp = np.ones(n * n, dtype=np.float32)
+        legal = np.zeros(n * n, dtype=bool)
+        assert (boost_log_offsets(own, opp, legal) == 0.0).all()

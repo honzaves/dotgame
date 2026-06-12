@@ -29,8 +29,8 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import (opportunity_masks, apply_boost, arc_potential_map,
-                          strategic_channels)
+from ai.features import (opportunity_masks, boost_log_offsets,
+                          arc_potential_map, strategic_channels)
 
 _TORCH_AVAILABLE = False
 try:
@@ -149,7 +149,7 @@ def _build_net(grid: int, n_blocks: int, channels: int = 64):
             self.val_fc2  = nn.Linear(64, 1)
 
         def forward(self, x):
-            """x: (B, 5, G, G) → (logits (B, G²), values (B,))"""
+            """x: (B, 15, G, G) → (logits (B, G²), values (B,))"""
             h = self.tower(self.stem(x))
 
             # Policy
@@ -183,9 +183,9 @@ class PyTorchPlayer(BasePlayer):
         self._opt      = torch.optim.Adam(
             self._net.parameters(), lr=S.PT_LEARNING_RATE
         )
-        # Trajectory: (enc_np, mask_np, action, log_prob_old, value_old)
+        # Trajectory: (enc_np, mask_np, action, log_prob_old, value_old, boost_np)
         self._traj:     list[tuple] = []
-        self._obs_traj: list[tuple] = []  # opponent-observed (board, action, log_p, val)
+        self._obs_traj: list[tuple] = []  # opponent-observed tuples, same 6-element layout
         self.load()
 
     # ── BasePlayer interface ──────────────────────────────────────────────────
@@ -207,19 +207,21 @@ class PyTorchPlayer(BasePlayer):
 
         enc_np = encode_state(board, connections, forbidden, player)
 
+        own_scores, opp_scores = opportunity_masks(board, connections, player)
+        boost_np = boost_log_offsets(own_scores, opp_scores, mask_np)
+
         with torch.no_grad():
             x    = torch.tensor(enc_np, dtype=torch.float32,
-                                device=self._device).unsqueeze(0)   # (1,7,G,G)
+                                device=self._device).unsqueeze(0)
             mask = torch.tensor(mask_np, dtype=torch.bool,
                                 device=self._device)
 
             logits, val = self._net(x)
-            logits = logits[0].clone()
+            logits = logits[0] + torch.tensor(boost_np, device=self._device)
             logits[~mask] = float('-inf')
             log_p  = F.log_softmax(logits, dim=0)
-            probs  = log_p.exp()
 
-            p_np = probs.cpu().numpy().astype(np.float64)
+            p_np = log_p.exp().cpu().numpy().astype(np.float64)
             p_np = np.where(np.isfinite(p_np), np.clip(p_np, 0.0, None), 0.0)
             total = p_np.sum()
             if total <= 0.0:
@@ -227,15 +229,12 @@ class PyTorchPlayer(BasePlayer):
             else:
                 p_np /= total
 
-            # Boost closing and blocking moves post-policy
-            own_scores, opp_scores = opportunity_masks(board, connections, player)
-            p_np = apply_boost(p_np, own_scores, opp_scores, mask_np)
-
             action       = int(np.random.choice(n * n, p=p_np))
             log_prob_old = float(log_p[action].item())
             value_old    = float(val[0].item())
 
-        self._traj.append((enc_np, mask_np, action, log_prob_old, value_old))
+        self._traj.append((enc_np, mask_np, action, log_prob_old,
+                           value_old, boost_np))
         return (action % n, action // n)
 
     def record_outcome(self, winner: int,
@@ -279,7 +278,7 @@ class PyTorchPlayer(BasePlayer):
             n = S.GRID
             states_t  = torch.tensor(
                 np.stack([t[0] for t in self._traj]),
-                dtype=torch.float32, device=self._device)          # (T,5,G,G)
+                dtype=torch.float32, device=self._device)          # (T,15,G,G)
             masks_t   = torch.tensor(
                 np.stack([t[1] for t in self._traj]),
                 dtype=torch.bool, device=self._device)
@@ -288,6 +287,9 @@ class PyTorchPlayer(BasePlayer):
                 dtype=torch.long, device=self._device)
             lp_old_t  = torch.tensor(
                 [t[3] for t in self._traj],
+                dtype=torch.float32, device=self._device)
+            boosts_t  = torch.tensor(
+                np.stack([t[5] for t in self._traj]),
                 dtype=torch.float32, device=self._device)
             adv_t     = torch.tensor(advantages, dtype=torch.float32,
                                      device=self._device)
@@ -315,7 +317,7 @@ class PyTorchPlayer(BasePlayer):
 
                     logits, vals_pred = self._net(b_states)
 
-                    logits = logits.clone()
+                    logits = logits + boosts_t[batch]
                     logits[~b_masks] = float('-inf')
                     log_p_all = F.log_softmax(logits, dim=1)
                     log_p     = log_p_all.gather(
@@ -377,6 +379,9 @@ class PyTorchPlayer(BasePlayer):
             obs_lp_old_t  = torch.tensor(
                 [t[3] for t in self._obs_traj],
                 dtype=torch.float32, device=self._device)
+            obs_boosts_t  = torch.tensor(
+                np.stack([t[5] for t in self._obs_traj]),
+                dtype=torch.float32, device=self._device)
             obs_adv_t     = torch.tensor(obs_adv, dtype=torch.float32,
                                          device=self._device)
             obs_ret_t     = torch.tensor(obs_ret, dtype=torch.float32,
@@ -408,7 +413,7 @@ class PyTorchPlayer(BasePlayer):
                     b_ret     = obs_ret_t[batch]
 
                     logits, vals_pred = self._net(b_states)
-                    logits = logits.clone()
+                    logits = logits + obs_boosts_t[batch]
                     logits[~b_masks] = float('-inf')
                     log_p_all = F.log_softmax(logits, dim=1)
                     log_p     = log_p_all.gather(
@@ -461,6 +466,9 @@ class PyTorchPlayer(BasePlayer):
 
         enc = encode_state(board, connections, forbidden, player_who_moved)
         action = gy * n + gx
+        own_scores, opp_scores = opportunity_masks(
+            board, connections, player_who_moved)
+        boost_np = boost_log_offsets(own_scores, opp_scores, mask_np)
 
         with torch.no_grad():
             x      = torch.tensor(enc, dtype=torch.float32,
@@ -468,13 +476,14 @@ class PyTorchPlayer(BasePlayer):
             mask_t = torch.tensor(mask_np, dtype=torch.bool,
                                   device=self._device)
             logits, val = self._net(x)
-            logits = logits[0].clone()
+            logits = logits[0] + torch.tensor(boost_np, device=self._device)
             logits[~mask_t] = float('-inf')
             log_p  = F.log_softmax(logits, dim=0)
             log_prob_old = float(log_p[action].item())
             value_old    = float(val[0].item())
 
-        self._obs_traj.append((enc, mask_np, action, log_prob_old, value_old))
+        self._obs_traj.append((enc, mask_np, action, log_prob_old,
+                               value_old, boost_np))
 
     def save(self) -> None:
         path = experience_path(S.PT_EXPERIENCE_BASE, '.pt')

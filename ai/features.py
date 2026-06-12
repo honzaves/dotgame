@@ -179,6 +179,26 @@ def apply_boost(
     return p
 
 
+def boost_log_offsets(
+    own_scores: np.ndarray,
+    opp_scores: np.ndarray,
+    legal: np.ndarray,
+) -> np.ndarray:
+    """Log-domain equivalent of apply_boost().
+
+    softmax(logits + boost_log_offsets(...)) over the legal set equals
+    apply_boost(softmax(logits), ...).  Folding the boost into the logits
+    keeps the sampling distribution and the trainable policy identical, so
+    PPO ratios / policy gradients are computed against the true behaviour
+    policy.  Returns float32 (G²,) with 0.0 at illegal positions.
+    """
+    close_boost = getattr(S, 'AI_CLOSE_BOOST', 4.0)
+    block_boost = getattr(S, 'AI_BLOCK_BOOST', 3.0)
+    mult = ((1.0 + (close_boost - 1.0) * own_scores.astype(np.float64))
+            * (1.0 + (block_boost - 1.0) * opp_scores.astype(np.float64)))
+    return np.where(legal, np.log(mult), 0.0).astype(np.float32)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Enclosure potential
 # ═══════════════════════════════════════════════════════════════════════════════
