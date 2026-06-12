@@ -41,7 +41,8 @@ from ai.features import (opportunity_masks, apply_boost,
                           enclosure_potential, enclosure_scalars,
                           arc_potential_scalars, arc_potential_map,
                           bridge_potential, disruption_map, fork_map,
-                          close_setup_map, get_centrality)
+                          close_setup_map, get_centrality,
+                          adaptive_dirichlet_alpha)
 
 # Short rollouts → far more simulations per second.
 # Increase to trade throughput for accuracy (sweet spot ≈ 15-30).
@@ -560,7 +561,8 @@ class MCTSPlayer(BasePlayer):
         if self._noise_frac > 0 and len(legal) > 1:
             # Adaptive alpha: AlphaZero uses alpha ∝ 1/n_legal so the noise
             # distribution is always appropriately spiky regardless of board size.
-            adaptive_alpha = max(0.01, self._noise_alpha * 10.0 / len(legal))
+            # Floored at 0.1 to avoid single-spike noise on large open boards.
+            adaptive_alpha = adaptive_dirichlet_alpha(self._noise_alpha, len(legal))
             eta   = np.random.dirichlet([adaptive_alpha] * len(legal))
             frac  = self._noise_frac
             items = list(raw_priors.items())

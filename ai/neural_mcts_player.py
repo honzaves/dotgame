@@ -44,7 +44,7 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import opportunity_masks, arc_potential_map
+from ai.features import opportunity_masks, arc_potential_map, adaptive_dirichlet_alpha
 
 _TORCH_AVAILABLE = False
 try:
@@ -201,9 +201,10 @@ class NeuralMCTSPlayer(BasePlayer):
 
         # ── Dirichlet noise for exploration ───────────────────────────────────
         # Prevents deterministic play and ensures diversity in training data.
-        # Adaptive alpha keeps spikiness consistent regardless of board size.
+        # Adaptive alpha keeps spikiness consistent regardless of board size;
+        # floored at 0.1 to avoid single-spike noise on large open boards.
         if S.NM_NOISE_FRAC > 0 and len(legal) > 1:
-            alpha = max(0.01, S.NM_NOISE_ALPHA * 10.0 / len(legal))
+            alpha = adaptive_dirichlet_alpha(S.NM_NOISE_ALPHA, len(legal))
             eta   = np.random.dirichlet([alpha] * len(legal))
             for i, (gx, gy) in enumerate(legal):
                 idx              = gy * n + gx

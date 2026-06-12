@@ -535,6 +535,16 @@ def get_centrality() -> np.ndarray:
     return _CENTRALITY_CACHE[n]
 
 
+def adaptive_dirichlet_alpha(base_alpha: float, n_legal: int) -> float:
+    """AlphaZero-style root-noise concentration: alpha ∝ 1/branching factor.
+
+    Floored at 0.1 — below that the Dirichlet sample is so spiky that
+    essentially all noise mass lands on a single arbitrary move, which makes
+    the noise a coin-flip override instead of gentle diversification.
+    """
+    return max(0.1, base_alpha * 10.0 / max(n_legal, 1))
+
+
 # ── Component interior finder (used by disruption map) ───────────────────────
 
 def _component_interior(comp: set, n: int) -> set:

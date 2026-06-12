@@ -529,3 +529,14 @@ class TestBoostLogOffsets:
         opp = np.ones(n * n, dtype=np.float32)
         legal = np.zeros(n * n, dtype=bool)
         assert (boost_log_offsets(own, opp, legal) == 0.0).all()
+
+
+class TestAdaptiveDirichletAlpha:
+    def test_floor_at_point_one(self):
+        from ai.features import adaptive_dirichlet_alpha
+        assert adaptive_dirichlet_alpha(0.3, 100) == pytest.approx(0.1)
+
+    def test_scales_inversely_with_branching(self):
+        from ai.features import adaptive_dirichlet_alpha
+        assert adaptive_dirichlet_alpha(0.3, 10) == pytest.approx(0.3)
+        assert adaptive_dirichlet_alpha(0.3, 5)  == pytest.approx(0.6)
