@@ -27,122 +27,85 @@ you could just imagine thousands of different futures — what if I take that jo
 — and count how many turned out well. MCTS does exactly the latter. Instead of figuring out *why*
 a move is good, it runs thousands of imaginary futures forward and counts the wins.
 
+### What it knows about the game
+
+The decisive plan in Dot Grid is a **big ring**: a closed chain of dots around half the board
+wins on the spot and captures everything inside. Twenty well-placed dots are enough on a 10×10
+board. An AI that only notices small squares being completed never sees this coming — which is
+exactly how earlier versions of this AI could be beaten by anyone who quietly built one large
+ring.
+
+So before it imagines any futures, MCTS now measures the **ring race**:
+
+- *How many more dots do I need to close a winning ring?*
+- *How many does my opponent need?*
+- *Which points do those rings pass through?*
+
+It answers these exactly, including detours around the other side's dots. That last part
+matters: dropping a single dot into the path of a ring usually achieves nothing, because the
+ring simply steps around it. The AI knows the difference between a block that really costs the
+opponent a move and one that doesn't.
+
 ### How it works, step by step
 
-**Step 1 — Building a tree.**
-Every time MCTS thinks about a move, it constructs a tree. At the top is the current board
-position. Each branch is a possible move, each branch of that branch is a possible response, and
-so on. The tree is a map of all possible futures.
-
-**Step 2 — Choosing which branches to explore (PUCT priors).**
-With 80+ possible moves, MCTS can't explore everything. It gives each candidate move a *prior
-score* before any exploration — a first impression of how promising that move looks. These priors
-are built from eight signals, ranked roughly by certainty:
+**Step 1 — Score every move.**
+For each legal move the AI works out, with the real rules:
 
 | Signal | What it rewards |
 |--------|-----------------|
-| Immediate close | Completing a unit square or triangle right now |
-| Opponent block | Stopping the opponent completing one |
-| Territory setup | Creating a 3-own-corner position — a next-turn threat |
-| Arc extension | Extending a ring arc in progress (partial-ring aware, see below) |
-| Arc block | Stopping the opponent extending their ring |
-| Arc bridge | Closing a gap between two of your own arcs to form a larger ring |
-| Cluster growth | Placing adjacent to your existing dots to grow 2-dimensionally |
-| Centrality | A small baseline so central positions are explored first on an empty board |
+| Exact gain | Territory this move wins right now — a triangle, a square, or a 40-cell ring with captures |
+| Threats left | The biggest thing the opponent could still do next move |
+| Ring race | Who is ahead in the race for a winning ring after this move |
+| Ring potential | How good both sides' best smaller rings are, when nobody can win outright |
 
-Dirichlet noise is added to these priors each turn so that different games explore different
-territory (see "Personality profiles and non-determinism" below).
+A move that wins immediately is simply played.
 
-**Step 3 — Running quick simulations.**
-Once the tree points to an unexplored position, the AI plays out the rest of the game quickly
-using a six-tier priority:
+**Step 2 — Build a tree, most promising moves first.**
+At the top is the current position; each branch is a move, each branch of that a reply. The
+scores from step 1 decide where the search spends its effort.
 
-1. **Fork** — creates two simultaneous threats the opponent can only answer one of
-2. **Close** — scores territory right now
-3. **Block** — stops the opponent scoring
-4. **Setup** — creates a 3-own-corner position for next turn
-5. **Adjacent** — extends your own dot cluster (50% bias)
-6. **Random** — last resort
+**Step 3 — Play out full games.**
+From each new position the AI plays the game to the very end with random moves, many hundreds
+of times per turn, using the *exact* rules — real territory, real captures, real win
+conditions. The scores from step 1 say where to look; the playouts say what actually works.
 
-**Step 4 — Evaluating positions mid-rollout.**
-Most simulations don't finish the full game. The AI evaluates the position using four signals:
+**Step 4 — Update the tree.**
+Results ripple back up the tree. Moves that keep leading to wins get explored more.
 
-| Signal | Weight | Why |
-|--------|--------|-----|
-| Dot ratio | 15% | Basic board presence |
-| Connection ratio | 10% | Local structure |
-| Territory potential | 25% | Immediate scoring opportunities on each side |
-| Arc potential | 50% | How large a ring each side is building (partial-ring aware) |
-
-The arc potential signal is the most important — it ensures MCTS values a nearly-complete ring
-around 15 squares far more than 15 scattered dots.
-
-**Step 5 — Updating the tree.**
-Results ripple back up the tree. Over hundreds of simulations, the tree learns which moves lead
-to wins.
-
-**Step 6 — Choosing the final move.**
-After the time budget runs out, the AI picks the move scoring best on win rate combined with the
-same eight prior signals. A move visited 500 times at 60% beats one visited 50 times at 70% —
+**Step 5 — Choose the most-visited move.**
+A move tried 500 times with good results beats one tried 50 times with slightly better ones —
 the second hasn't been tested enough to trust.
 
-**Step 7 — Remembering for next time.**
-MCTS saves its tree between moves (reusing thinking from earlier in the game) and saves position
-win-rates to a file between games to warm-start future searches.
-
-### What "partial-ring aware" means
-
-Earlier versions of the ring signal used a flood-fill that leaked through any gap in the ring,
-returning zero until the very last gap was closed. This made MCTS completely blind to ring-building
-during the entire construction phase — every step looked equally worthless until the ring was
-complete. The current arc potential uses a bounding-box × completion-ratio formula that fires
-continuously as the ring is built, growing from the first arc placed to the completed ring.
-Straight lines score zero (no 2D bounding box area); a ring half-built already scores half its
-eventual reward.
+**Step 6 — Remembering for next time.**
+MCTS keeps its tree between moves, and saves the results of finished games as a small opening
+book that nudges its first few moves in later games.
 
 ### Personality profiles and non-determinism
 
-Pure MCTS is deterministic: given the same board, it always makes the same choice. Two identical
-instances playing each other would mirror every move perfectly. Two mechanisms break this:
+Games differ because the playouts are random, and because a little random noise is mixed into
+the move preferences each turn.
 
-**Dirichlet noise** — random perturbation of the priors each turn, where a few random positions
-get a large boost and most get almost nothing (spiky, not uniform). The spikiness adapts to the
-number of legal moves so the effect is consistent regardless of board state.
-
-**MCTS vs MCTS personality profiles** — when two MCTS players face each other, they receive
-deliberately different weight profiles so they pursue genuinely different strategies:
+**MCTS vs MCTS personality profiles** — when two MCTS players face each other, they get
+deliberately different priorities:
 
 | | Opportunist (Player 1) | Strategist (Player 2) |
 |---|---|---|
-| Style | Grabs immediate territory aggressively | Builds large rings patiently |
-| Immediate close weight | 5.5 | 2.5 |
-| Arc extension weight | 2.5 | 7.0 |
-| Dirichlet noise fraction | 35% | 18% |
-| UCB exploration constant | 1.20 (narrower) | 1.65 (wider) |
-
-The Opportunist closes squares quickly and plays noisily; the Strategist explores more of the
-tree and invests in large ring constructions that pay off heavily when complete.
-
-### Deep territory mode
-
-The **DEEP TERR** toggle in Settings switches rollout scoring:
-
-- **OFF (default, fast):** Lightweight square-counting, ~500 rollouts/second.
-- **ON (slow, accurate):** Full flood-fill territory engine per simulated move — catches
-  triangles, encirclement, and forbidden positions correctly, but ~100× slower. Only worthwhile
-  at 2000 ms+ think time. Also available as a toggle in the training config screen.
+| Style | Takes territory as soon as it can | Invests in the ring race |
+| Weight on immediate gains | 3.5 | 1.5 |
+| Weight on the ring race | 0.8 | 1.2 |
+| Weight on ring potential | 1.0 | 2.2 |
+| Noise fraction | 25% | 10% |
 
 ### What it's good at
 
-MCTS doesn't need training — it plays strategic ring-building from the first move. Gets noticeably
-stronger with more thinking time. Games are varied because of Dirichlet noise and (in MCTS vs
-MCTS) distinct personality profiles.
+No training needed. It builds its own ring, cuts yours where it actually hurts, never misses a
+capture, and gets stronger with more thinking time.
 
 ### What it struggles with
 
-Tree search spreads too wide to plan many moves ahead. And even with strategic signals, the
-rollouts are still partly random after the first few moves — there's a ceiling on quality that
-more thinking time alone can't overcome.
+Its ring analysis looks for rings that curve around a handful of fixed centre points, so a very
+irregular enclosure can be noticed late. And once the board is carved up and no big ring is
+possible, it relies mostly on the playouts, which are random and therefore only a rough guide.
 
 ---
 
@@ -222,8 +185,10 @@ arc potential and bridge signals are visible to it.
 
 ### What it struggles with
 
-Needs substantial training to be any good. A freshly created network plays almost randomly. It
-also can't look ahead — it can only react to what it sees on the board right now.
+It can't look ahead — it reacts to the board as it is right now. To keep it from playing
+randomly while it learns, the same move scores MCTS uses (step 1 above) are added to its
+preferences: an untrained network already plays the best-looking move most of the time, and
+training teaches it where that first impression is wrong.
 
 ---
 
@@ -281,84 +246,49 @@ board state, not just the local neighbourhood.
 
 ### What it struggles with
 
-Needs the most training time to reach its potential. Also requires PyTorch (`pip install torch`).
+Like the Neural Network it has no lookahead, and it starts from the same move scores. Needs the
+most training time to improve on them. Also requires PyTorch (`pip install torch`).
 
 ---
 
-## 4. Neural MCTS — The Self-Improving Planner
+## 4. Neural MCTS — The Planner That Learns
 
-**Full name:** AlphaZero-style MCTS guided by a residual CNN
+**Full name:** MCTS guided by a residual CNN
 
 ### The core idea
 
-Each of the first three AIs has one fatal weakness: MCTS has hand-crafted signals instead of
-learned intuition; the Neural Network and PyTorch Network have learned intuition but no ability
-to look ahead. Neural MCTS fixes both at once by making the CNN and the tree search partners
-that continuously improve each other.
-
-The basic concept comes from AlphaZero — the same architecture that mastered chess, Go, and
-shogi without any human-provided strategy beyond the rules.
+MCTS plans but never learns; the networks learn but never plan. Neural MCTS is the MCTS player
+with a network watching over its shoulder: the search plays, the network studies what the search
+found, and — once it has studied enough — starts telling the search where to look.
 
 ### How it works
 
-**Step 1 — Network call at the root.**
-At the start of each turn, the CNN evaluates the current board position and produces two outputs:
-a *policy* (which moves look promising) and a *value* (how well-placed are we right now?). The
-policy replaces the hand-crafted eight-signal priors that pure MCTS uses.
+**Step 1 — The search runs as in MCTS.**
+Same ring-race analysis, same tree, same full-game playouts with the exact rules.
 
-**Step 2 — PUCT search.**
-Instead of branching equally into all legal moves, the tree focuses on moves the policy rates
-highly. The formula is: `Q + c_puct × P × √parent_visits / (1 + child_visits)`. Q is the
-average value from past simulations; P is the network's prior; the square root term decays so
-well-visited children stop getting automatic priority.
+**Step 2 — The network adds its opinion at the start of each turn.**
+Its *policy* output (which moves look promising) is blended into the search's move preferences,
+and its *value* output rates the positions after the handful of best-looking moves.
 
-**Step 3 — Expand, don't roll out.**
-When the search reaches a position it has never seen before, instead of simulating the rest of
-the game with random moves (like pure MCTS does), it simply calls the network once to get the
-value of that position. One forward pass replaces hundreds of random moves. This lets the same
-time budget explore far more tree nodes, because each new node costs microseconds rather than
-milliseconds.
+**Step 3 — Trust is earned.**
+How much the network's opinion counts depends on how much it has been trained. A brand-new
+network has zero influence, so Neural MCTS starts out playing exactly like MCTS. Influence rises
+steadily over the first few hundred training steps (about 150 games) up to a fixed maximum.
 
-**Step 4 — Backpropagate.**
-The value propagates back up the tree exactly like regular MCTS. Over many simulations the tree
-learns which branches are genuinely better, even if the initial network estimates were wrong.
+### How it trains
 
-**Step 5 — Choose the most-visited move.**
-After the time budget runs out, the move that was visited most often is chosen. Visit counts are
-far more reliable than a single network guess.
+After each game, two things are recorded for every move:
+- The **visit distribution**: how often the search tried each move. That is a better answer than
+  the network's own first guess, because the search looked ahead.
+- The **game outcome** plus shaping rewards.
 
-### How it trains — the self-improvement loop
-
-After each game, two things are recorded:
-- The **visit distribution**: how many simulations visited each move at the root. This is better
-  than the raw network prior — the tree searched deeper and found things the network alone missed.
-- The **game outcome** plus shaping rewards (territory delta + arc-potential delta).
-
-The network is then trained to predict both: make the policy head output look like the visit
-distribution (cross-entropy loss), and make the value head output predict the actual returns
-(mean-squared-error loss). No PPO or clipping is needed: the visit distribution is a stable
-supervised target, not a noisy self-bootstrapped estimate.
-
-This creates the self-improvement loop: a stronger network → better priors and leaf values →
-better tree search → better visit distributions → stronger network → ...
-
-### Why it beats the other AIs given enough training
-
-**vs. pure MCTS:** Neural MCTS learns which moves are worth exploring rather than distributing
-simulations based on hand-crafted formulas. It also learns accurate position values, so short
-search trees give reliable estimates. The hand-crafted signals in pure MCTS encode specific
-strategic patterns you thought of; the learned policy encodes everything the tree discovered.
-
-**vs. Neural Network / PyTorch Net:** Same CNN, but paired with tree search. The network alone
-reacts to the current position; Neural MCTS looks 10–20 moves ahead, guided by the network at
-every step.
+The network is trained to predict both. The loop: a better network → a better-focused search →
+better examples to learn from → a better network.
 
 ### What it struggles with
 
-Needs meaningful training before it surpasses pure MCTS. A freshly created Neural MCTS with a
-random network is actually *weaker* than pure MCTS — bad priors mislead the search. Train against
-MCTS first (100–200 rounds) to bootstrap reasonable priors, then switch to self-play to enter the
-improvement loop. Also requires PyTorch (`pip install torch`).
+Until it has trained it is simply MCTS with a little overhead. Requires PyTorch
+(`pip install torch`).
 
 ---
 
@@ -366,60 +296,40 @@ improvement loop. Also requires PyTorch (`pip install torch`).
 
 | | MCTS | Neural Network | PyTorch Network | Neural MCTS |
 |---|---|---|---|---|
-| **Needs training to be good?** | No | Yes | Yes | Yes (bootstrap first) |
-| **Gets stronger with thinking time?** | Strongly | No | No | Yes (more simulations) |
-| **Plays ring-building strategy?** | Yes (built-in arc potential) | Yes, after training | Yes, after training | Yes (learns + searches) |
-| **Arc-potential shaping reward?** | N/A | Yes | Yes | Yes |
-| **Varies between games?** | Yes (noise + profiles) | Yes (sampling) | Yes (sampling) | Yes (noise + sampling) |
-| **Trained on score margin?** | N/A | Yes | Yes | Yes |
-| **Looks ahead explicitly?** | Yes (tree) | No | No | Yes (tree + network) |
+| **Needs training to be good?** | No | No (improves with it) | No (improves with it) | No (improves with it) |
+| **Gets stronger with thinking time?** | Strongly | Slightly (fuller analysis) | Slightly (fuller analysis) | Strongly |
+| **Understands the ring race?** | Yes | Yes (move scores) | Yes (move scores) | Yes |
+| **Plays with the exact rules?** | Yes | Yes (one move deep) | Yes (one move deep) | Yes |
+| **Varies between games?** | Yes | Yes (sampling) | Yes (sampling) | Yes |
+| **Looks ahead explicitly?** | Yes (tree) | No | No | Yes (tree) |
 | **Requires extra software?** | No | No | Yes (PyTorch) | Yes (PyTorch) |
-| **Ceiling after extensive training?** | Fixed | Medium | High | Highest |
 
 ---
 
 ## How All Four React to Opportunities
 
-All four AIs share a move-selection boost applied on top of their core decision-making:
+All four AIs start from the same exact move scores: territory a move wins right now, the
+biggest threat it leaves standing, and the ring race afterwards.
 
-**Closing boost (4×):** Completing a territory square or triangle → up to 4× multiplier (scales
-with territory count: closing two squares at once → 7×; single triangle → 2.5×).
+- **MCTS** and **Neural MCTS** use the scores to decide where to search, then test the
+  candidates with thousands of full-game playouts.
+- The **Neural** and **PyTorch Networks** add the scores to their own preferences and pick from
+  the result — no lookahead beyond that.
 
-**Blocking boost (3×):** Opponent about to close → up to 3×.
-
-For MCTS, tactical awareness works at three levels: priors (closing moves get explored first),
-rollout policy (six-tier priority from fork to random), and final selection (win rate blended with
-all prior signals). Each MCTS instance's exact weights depend on its personality profile.
-
-For the Neural and PyTorch Networks, the boost is applied after the network outputs its policy.
-As training progresses the network learns to assign high probabilities to good moves on its own,
-so the boost becomes a safety net rather than the primary driver.
-
-For Neural MCTS, the boost is applied to the root priors at the start of each turn as a safety
-net during the early untrained phase. As the network matures it learns to rate closing and
-blocking moves highly on its own, so the boost becomes redundant.
+A move that wins the game on the spot is always played by MCTS and Neural MCTS, and is by far
+the most likely choice of the two networks.
 
 ---
 
 ## Tips for Getting the Best from Each AI
 
-**MCTS:** Give it more thinking time. At 100 ms it's decent; at 1000 ms (the default) it's quite
-strong. In MCTS vs MCTS mode watch the two styles emerge: the Opportunist tends to scatter quick
-captures early while the Strategist builds slower, larger rings. The **DEEP TERR** toggle in
-Settings adds full flood-fill accuracy to rollouts — only worth enabling at 2000 ms+ think time.
+**MCTS:** Give it thinking time. Below 150 ms it uses a simplified analysis; at 1000 ms (the
+default) it analyses fully and plays out many hundreds of games per move. In MCTS vs MCTS mode
+watch the two styles: the Opportunist takes territory early, the Strategist invests in its ring.
 
-**Neural Network:** Train for several hundred games before playing against it. The arc-potential
-shaping reward means ring-building strategy now emerges in fewer games than before — you should
-see genuine ring attempts after a few hundred rounds of training rather than purely reactive play.
+**Neural Network / PyTorch Network:** They play sensibly untrained, because they start from the
+exact move scores. Train them against MCTS (a few hundred games) so they learn where those
+scores are wrong; they have no lookahead, so expect them to stay below MCTS in strength.
 
-**PyTorch Network:** Needs the most training but becomes the strongest pure-network AI. Train in
-batches of 100–500 games. After 1000+ games it should play strategic, coherent Dot Grid — building
-rings, bridging arcs, and claiming large territories rather than just harvesting small immediate
-scores. The PPO training stability means you can leave it training overnight without worrying about
-catastrophic regressions.
-
-**Neural MCTS:** Start with `Neural MCTS vs MCTS` at 200–500 ms for 100–200 rounds. The MCTS
-teacher bootstraps reasonable priors quickly. Then switch to `Neural MCTS vs Neural MCTS` self-play
-to enter the improvement loop. Given 500–1000 self-play games it will surpass every other AI at
-the same time budget — it gets both the positional intuition of the CNN and the lookahead of the
-tree, and the two components keep making each other better.
+**Neural MCTS:** Plays like MCTS from the start. Train it by self-play or against MCTS at
+200–500 ms; after about 150 games the network has full influence on where the search looks.

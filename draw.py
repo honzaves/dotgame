@@ -530,18 +530,11 @@ def draw_settings_screen(surf, fonts, win_w, win_h, think_ms, mcts_profile=0):
     pygame.draw.line(surf, S.C_BORDER, (cx - 160, y), (cx + 160, y), 1)
     y += 16
 
-    # Deep territory toggle
-    _on   = getattr(S, 'MCTS_REAL_ROLLOUT', False)
-    _tcol = (60, 180, 100) if _on else (130, 130, 130)
-    _tlbl = "DEEP TERR:  ON" if _on else "DEEP TERR:  OFF"
-    deep_w      = 260
-    deep_terr_r = pygame.Rect(cx - deep_w // 2, y, deep_w, 36)
-    _button(surf, fs, _tlbl, deep_terr_r, col=_tcol)
-    y += 36 + 6
-
-    for d in ("ON: full flood-fill scoring in rollouts (accurate territory + forbidden zones)",
-              "OFF: fast square-counting only — default, ~3× more rollouts per second",
-              "No extra delay either way — same think time, different rollout quality"):
+    # The former "Deep Terr" toggle is gone: the search now always simulates
+    # with the exact territory engine.  The tuple slot stays (always None).
+    deep_terr_r = None
+    for d in ("All AIs simulate with the exact rules: full territory, captures, forbidden zones",
+              "Longer think time = more simulations = stronger play"):
         dt = fx.render(_fit_label(fx, d, win_w - 80), True, S.C_DIM)
         surf.blit(dt, (cx - dt.get_width() // 2, y))
         y += dt.get_height() + 2
@@ -559,11 +552,11 @@ _ARCH_DESCRIPTIONS = {
     "MCTS": (
         "MCTS — Monte Carlo Tree Search",
         [
-            "Explores thousands of imagined futures each turn by building a tree of moves.",
-            "Strategic signals guide which branches matter: closing territory is first priority,",
-            "building large rings is valued throughout construction (not just at completion),",
-            "and Dirichlet noise ensures different games play out differently.",
-            "Gets noticeably stronger with more thinking time. No training required.",
+            "Plays out hundreds of imagined games each turn with the exact rules: real",
+            "territory, captures and win conditions. A ring-race analysis tells it how many",
+            "dots each side still needs for a winning ring, so it builds its own ring,",
+            "cuts yours where it actually hurts, and never misses a big capture.",
+            "Gets stronger with more thinking time. No training required.",
         ],
     ),
     "NN": (
@@ -572,8 +565,8 @@ _ARCH_DESCRIPTIONS = {
             "Learns by playing thousands of games. Sees the board as 15 overlapping",
             "feature maps: dot positions, territory threats, ring arcs in progress,",
             "bridge opportunities, game phase, and spatial centrality.",
-            "Develops move intuition without looking ahead. Starts weak, improves with",
-            "training. No extra software required beyond numpy.",
+            "Its move intuition is added on top of the exact ring-race move scores, so it",
+            "plays sensibly from the first game and refines with training. Needs only numpy.",
         ],
     ),
     "PT": (
@@ -581,17 +574,17 @@ _ARCH_DESCRIPTIONS = {
         [
             "A convolutional network that sees the board as an image. Sliding 3×3 filters",
             "detect local patterns; residual blocks stack them into a wide field of view.",
-            "Trained with PPO — a stable algorithm that prevents large policy swings.",
-            "Strongest AI given enough training. Requires: pip install torch",
+            "Trained with PPO — a stable algorithm that prevents large policy swings —",
+            "on top of the exact ring-race move scores. Requires: pip install torch",
         ],
     ),
     "NM": (
-        "Neural MCTS — AlphaZero-style (needs torch, best AI)",
+        "Neural MCTS — search + learning (needs torch)",
         [
-            "Combines tree search with a learned CNN: the policy head guides which branches",
-            "to explore (replacing hand-crafted priors), and the value head evaluates leaf",
-            "nodes (replacing random rollouts). Trains on MCTS visit distributions, not raw",
-            "policy outputs — the tree's opinion improves the network, which improves the tree.",
+            "The MCTS search plus a CNN that learns from it. The network is trained on the",
+            "search's visit counts and game outcomes; as training accumulates, its policy",
+            "head re-weights the root moves and its value head pre-rates the top candidates.",
+            "Untrained it plays like MCTS; trained it focuses the search better.",
             "Requires: pip install torch",
         ],
     ),
@@ -760,12 +753,12 @@ def draw_arch_overlay(surf, fonts, win_w, win_h, ai_type, scroll_y=0):
     if ai_type == "MCTS":
         for label, detail in [
             ("Board position",   f"{G}×{G} grid, up to {G*G} legal moves"),
-            ("Strategic priors", "close(4×) block(3×) arc-ext(5×) bridge(3×) setup(2.5×) + noise"),
-            ("UCB selection",    "win_rate + C · prior/√visits  (PUCT)"),
-            ("6-tier rollout",   "fork → close → block → setup → adjacent → random"),
-            ("Leaf evaluation",  "arc-potential 50% · territory 25% · dots 15% · conns 10%"),
+            ("Ring-race analysis", "dots each side needs for a winning ring"),
+            ("Move scores",      "exact captures/threats + race after each move"),
+            ("PUCT selection",   "Q + c · prior · √N_parent / (1 + N_child)"),
+            ("Playout",          "full game to the end with the exact rules"),
             ("Backpropagation",  "result flows up the tree to all parent nodes"),
-            ("Final move",       "best win_rate + territory blend, min 3 visits required"),
+            ("Final move",       "most-visited root move"),
         ]:
             _box(label, detail, bx, dy, box_w, bh_b)
             _arrow(bx + box_w//2, dy + bh_b, bx + box_w//2, dy + bh_b + arr_l)
@@ -851,12 +844,11 @@ def draw_arch_overlay(surf, fonts, win_w, win_h, ai_type, scroll_y=0):
         for label, detail in [
             ("Board state",      f"15 ch × {G}×{G} = {15*G*G} values"),
             ("Policy head",      f"→ prior P(s,a) for all {G*G} moves"),
-            ("Value head",       "→ position value  ∈ [-1, 1]"),
-            ("Root priors",      "Dirichlet noise + tactical boost applied"),
-            ("PUCT selection",   "Q + c_puct · P · √N_parent / (1 + N_child)"),
-            ("Expand leaf",      "network call → populate children with priors"),
-            ("Backprop value",   "value head result flows up tree (no rollout)"),
-            ("Visit distribution", "π_mcts = visit_counts / total visits"),
+            ("Value head",       "→ rates positions after the top moves"),
+            ("Root priors",      "ring-race scores ⊕ policy head (by trust)"),
+            ("Exact-rules search", "PUCT tree + full-game playouts (as MCTS)"),
+            ("Visit distribution", "π_search = visit_counts / total visits"),
+            ("Training",         "policy ← π_search,  value ← game outcome"),
         ]:
             _box(label, detail, bx, dy, box_w, bh_b,
                  border=_NM_COL, lbl_col=_NM_COL if label in ("Policy head", "Value head") else None)
@@ -866,7 +858,7 @@ def draw_arch_overlay(surf, fonts, win_w, win_h, ai_type, scroll_y=0):
 
         dy += 16
         pygame.draw.line(diagram, S.C_BORDER, (40, dy), (win_w-40, dy), 1)
-        t = fx.render("Training: CE(π_mcts, π_net) + MSE(v_pred, GAE_return) + entropy",
+        t = fx.render("Training: CE(π_search, π_net) + MSE(v_pred, outcome/GAE blend) + entropy",
                       True, S.C_DIM)
         dy += 6
         diagram.blit(t, (cx - t.get_width()//2, dy))
@@ -875,7 +867,7 @@ def draw_arch_overlay(surf, fonts, win_w, win_h, ai_type, scroll_y=0):
                        True, S.C_DIM)
         diagram.blit(t2, (cx - t2.get_width()//2, dy))
         dy += t2.get_height() + 4
-        t3 = fx.render(f"c_puct={S.NM_C_PUCT}  noise_frac={S.NM_NOISE_FRAC}"
+        t3 = fx.render(f"trust≤{S.NM_MAX_TRUST} after {S.NM_TRUST_STEPS} steps  c_puct={S.NM_C_PUCT}"
                        f"  lr={S.NM_LEARNING_RATE}  γ={S.NM_DISCOUNT}  λ={S.NM_GAE_LAMBDA}",
                        True, S.C_DIM)
         diagram.blit(t3, (cx - t3.get_width()//2, dy))
@@ -1024,21 +1016,11 @@ def draw_train_config(surf, fonts, win_w, win_h,
         opp_prof_val   = S.MCTS_PROFILE_LABELS.get(opp_profile_idx, "Default")
         prev_opp_prof, next_opp_prof, h = _row(opp_prof_label, opp_prof_val, y); y += h + row_gap
 
-    y -= row_gap  # remove last extra gap before deep-terr toggle
+    y -= row_gap  # remove last extra gap before the info line
     y += 6
 
-    # Deep territory toggle
-    _on   = getattr(S, 'MCTS_REAL_ROLLOUT', False)
-    _tcol = (60, 180, 100) if _on else (110, 110, 110)
-    _tlbl = "DEEP TERR: ON (accurate)" if _on else "DEEP TERR: OFF (fast)"
-    deep_w      = btn_w
-    deep_terr_r = pygame.Rect(cx - deep_w // 2, y, deep_w, 32)
-    _button(surf, fx, _tlbl, deep_terr_r, col=_tcol)
-    y += 32 + 6
-
-    info = fx.render("Deep Terr: full flood-fill scoring per rollout step (~3× fewer rollouts, same think time)", True, S.C_DIM)
-    surf.blit(info, (cx - info.get_width() // 2, y))
-    y += info.get_height() + 4
+    # Former "Deep Terr" toggle slot — always None now (exact rules always on)
+    deep_terr_r = None
     info2 = fx.render("Reward shaping + arc potential shaping enabled", True, S.C_DIM)
     surf.blit(info2, (cx - info2.get_width() // 2, y))
     y += info2.get_height() + 14

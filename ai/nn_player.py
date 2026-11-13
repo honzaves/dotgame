@@ -31,8 +31,9 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import (opportunity_masks, boost_log_offsets,
+from ai.features import (opportunity_masks,
                           arc_potential_map, strategic_channels)
+from ai.strategy import guidance_offsets
 
 # Adam hyper-parameters
 _BETA1  = 0.9
@@ -54,6 +55,11 @@ def _relu(x):
 def _softmax(x):
     e = np.exp(x - x.max())
     return e / e.sum()
+
+def _bound(logits):
+    """Squash raw policy logits to ±AI_NET_LOGIT_BOUND (see settings)."""
+    c = S.AI_NET_LOGIT_BOUND
+    return c * np.tanh(logits / c)
 
 def _xavier(fan_in, fan_out):
     limit = np.sqrt(6.0 / (fan_in + fan_out))
@@ -130,7 +136,7 @@ class _ACNetwork:
 
     def policy(self, x: np.ndarray, legal_mask: np.ndarray, boost=None):
         logits, value, acts = self.forward(x)
-        masked = logits.copy()
+        masked = _bound(logits)
         if boost is not None:
             masked += boost
         masked[~legal_mask] = -1e9
@@ -153,7 +159,8 @@ class _ACNetwork:
         h  = acts[-1]   # trunk output
 
         # ── Policy head (masked + boosted softmax) ───────────────────────────
-        logits = h @ self._pol_w.w + self._pol_b.w
+        bounded = _bound(h @ self._pol_w.w + self._pol_b.w)
+        logits = bounded
         if boost_log is not None:
             logits = logits + boost_log
         if legal_mask is not None:
@@ -172,6 +179,8 @@ class _ACNetwork:
         d_pol     += _ENTROPY_COEF * d_entropy
         if legal_mask is not None:
             d_pol[~legal_mask] = 0.0      # no gradient through dead logits
+        # Chain rule through the tanh bound: d(bounded)/d(raw) = 1 − tanh²
+        d_pol *= 1.0 - (bounded / S.AI_NET_LOGIT_BOUND) ** 2
 
         # Save pre-update weights for correct trunk backprop
         w_pol_pre = self._pol_w.w.copy()
@@ -222,6 +231,10 @@ class _ACNetwork:
 
     def load(self, path: str, grid: int = 0, hidden: list = None) -> None:
         data = np.load(path)
+        # Reject poisoned files (NaN/inf) — a dead network plays uniformly
+        if any(data[k].dtype.kind == 'f' and not np.isfinite(data[k]).all()
+               for k in data.files):
+            return
         # Reject weights from a different grid size or hidden architecture
         if 'meta_grid' in data:
             saved_grid     = int(data['meta_grid'][0])
@@ -352,8 +365,7 @@ class NNPlayer(BasePlayer):
             return (0, 0)
 
         enc = encode_state(board, connections, forbidden, player)
-        own_scores, opp_scores = opportunity_masks(board, connections, player)
-        boost = boost_log_offsets(own_scores, opp_scores, legal_flat)
+        boost = guidance_offsets(board, player, scores, forbidden)
 
         probs, val, acts = self._net.policy(enc, legal_flat, boost)
 
@@ -481,14 +493,13 @@ class NNPlayer(BasePlayer):
             for by in range(n) for bx in range(n)
         ], dtype=bool)
 
-        if not legal_mask.any():
-            return
+        action = gy * n + gx
+        if not legal_mask[action]:
+            return  # illegal move (e.g. corrupt replay data) — nothing to learn
 
         enc    = encode_state(board, connections, forbidden, player_who_moved)
-        action = gy * n + gx
-        own_scores, opp_scores = opportunity_masks(
-            board, connections, player_who_moved)
-        boost = boost_log_offsets(own_scores, opp_scores, legal_mask)
+        boost = guidance_offsets(board, player_who_moved, None, forbidden,
+                                    fast=True)
 
         probs, val, acts = self._net.policy(enc, legal_mask, boost)
         self._obs_traj.append((enc, action, acts, val, boost, legal_mask))
@@ -507,3 +518,10 @@ class NNPlayer(BasePlayer):
                 self._net.load(path, grid=S.GRID, hidden=self._hidden)
             except Exception:
                 pass
+            # A collapsed policy (one move certain on an EMPTY board) sits
+            # in the flat part of the tanh bound and cannot learn its way
+            # back — start fresh instead.
+            n = S.GRID
+            logits, _, _ = self._net.forward(encode_state({}, set(), set(), 1))
+            if float(logits.max() - logits.min()) > 10 * S.AI_NET_LOGIT_BOUND:
+                self._net = _ACNetwork(15 * n * n, self._hidden, n * n)

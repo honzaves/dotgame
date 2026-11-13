@@ -1,58 +1,43 @@
-"""Neural MCTS player — AlphaZero-style search guided by a residual CNN.
+"""Neural MCTS player — tree search guided by a residual CNN.
 
 How it differs from the three other AI types
 ---------------------------------------------
-Pure MCTS (mcts.py)          — hand-crafted priors, random rollouts, no training
-Neural Network (nn_player)   — learned policy + value, no lookahead at all
-PyTorch Net (pytorch_player) — learned policy + value (CNN), no lookahead at all
-Neural MCTS (this file)      — learned policy + value (CNN) + MCTS tree search
+Pure MCTS (mcts.py)          — heuristic priors + playouts, no network
+Neural Network (nn_player)   — learned policy + value, no lookahead
+PyTorch Net (pytorch_player) — learned policy + value (CNN), no lookahead
+Neural MCTS (this file)      — the MCTS search core + a CNN that learns from it
 
-The CNN guides the tree in two ways:
-  policy head  → PUCT prior for each child   (replaces the hand-crafted raw_priors formula)
-  value head   → leaf-node evaluation        (replaces _eval_fast + random rollouts)
+Search
+  The same exact-rules search as MCTSPlayer (ai/search.py: bitboard engine,
+  ring-race priors, playouts).  The network contributes at the root:
+    policy head → blended into the root priors
+    value head  → rates the positions after the top candidate moves, seeded
+                  into the tree as virtual visits
+  Both contributions are scaled by a *trust* factor that grows from 0 to
+  NM_MAX_TRUST over the first NM_TRUST_STEPS training steps, so an untrained
+  network cannot mislead the search and a trained one increasingly steers it.
 
-This creates the AlphaZero self-improvement loop:
-  stronger network  →  better priors + leaf values
-  better search     →  better training data (visit distributions, outcomes)
-  better data       →  stronger network   →  ...
-
-Training signal per game
-  policy target  : MCTS visit distribution (not the raw network output)
-                   The tree's opinion of the best move is more accurate than the network's
-                   raw prior, especially with many simulations.  Training on visit counts
-                   directly teaches the network to replicate what the tree found.
-  value target   : GAE returns from territory-delta + arc-potential-delta shaping rewards
-                   (same shaping as PyTorchPlayer — teaches ring-building from early training)
-
-Architecture
-  Identical residual CNN to PyTorchPlayer (shared presets, separate weight file).
-  Training loss:  L = policy_coef · CE(π_mcts, π_net)
-                    + value_coef  · MSE(v_pred, v_target)
-                    − entropy_coef· H(π_net)
-  No PPO needed — the policy target is a stable supervised signal from the tree,
-  not a self-bootstrapped value estimate.
-
-Tree reuse
-  After each turn the chosen child's subtree is saved.  On the next turn its
-  grandchild matching the opponent's reply is promoted to root, inheriting all
-  accumulated visit counts.  Root priors are refreshed from the current network
-  call (including the fresh tactical boost and Dirichlet noise) so the reused
-  subtree still benefits from this turn's evaluation.  Children missing from
-  last turn's expansion are added with 0 visits and fresh priors.
+Training signal per game (AlphaZero-style)
+  policy target  : the search's visit distribution — the network learns to
+                   predict what the search found.
+  value target   : GAE returns from the shaping rewards blended with the
+                   final outcome z.
+  Loss:  L = policy_coef · CE(π_search, π_net)
+           + value_coef  · MSE(v_pred, v_target)
+           − entropy_coef· H(π_net)
 
 Requirements: pip install torch
 """
 
-import math
 import os
-import time
 
 import numpy as np
 
 import settings as S
 from ai.base_player import BasePlayer
+from ai.engine import BitGame, bits
 from ai.paths import experience_path
-from ai.features import opportunity_masks, arc_potential_map, adaptive_dirichlet_alpha
+from ai.search import Searcher, SearchConfig
 from ai.symmetry import transform_planes, transform_flat, N_TRANSFORMS
 
 _TORCH_AVAILABLE = False
@@ -63,41 +48,6 @@ try:
     _TORCH_AVAILABLE = True
 except ImportError:
     pass
-
-
-# ── Tree node ─────────────────────────────────────────────────────────────────
-
-class _NMNode:
-    """Tree node for Neural MCTS.
-
-    children = None   →  never visited; will be expanded on first visit
-    children = []     →  expanded (may be empty only at true terminal states)
-    """
-
-    __slots__ = ('move', 'parent', 'children', 'visits', 'total_value',
-                 'player_who_moved', 'prior', 'pending')
-
-    def __init__(self, move, parent, children, player_who_moved, prior=0.0):
-        self.move             = move
-        self.parent           = parent
-        self.children         = children  # None | list[_NMNode]
-        self.visits           = 0
-        self.total_value      = 0.0       # sum of backpropagated values
-        self.player_who_moved = player_who_moved
-        self.prior            = prior     # P(s,a) from parent's network evaluation
-        self.pending          = False     # awaiting batched network evaluation
-
-    def puct(self, c_puct: float) -> float:
-        """AlphaZero PUCT:  Q(s,a)  +  c_puct · P(s,a) · √N(s) / (1 + N(s,a))
-
-        Q is the average value from this node's perspective (fraction of visits
-        that were wins for the AI player who owns this search tree).
-        U is the exploration bonus — high for unvisited children with a strong prior.
-        """
-        parent_n = self.parent.visits if self.parent else 1
-        q = self.total_value / self.visits if self.visits > 0 else 0.0
-        u = c_puct * self.prior * math.sqrt(max(parent_n, 1)) / (1 + self.visits)
-        return q + u
 
 
 # ── Helpers that reuse PyTorchPlayer internals ────────────────────────────────
@@ -117,25 +67,12 @@ def _encode(board: dict, connections: set, forbidden: set, player: int):
 # ── NeuralMCTSPlayer ──────────────────────────────────────────────────────────
 
 class NeuralMCTSPlayer(BasePlayer):
-    """AlphaZero-style MCTS guided by a residual CNN.
+    """Exact-rules tree search whose root is steered by a residual CNN.
 
-    Starts weak (untrained network ≈ random priors) and improves continuously
-    through self-play or curriculum training.  Given enough training games it
-    surpasses pure MCTS at the same time budget:
-
-      - The policy head focuses the search on promising moves instead of
-        spreading simulations across all legal moves equally.
-      - The value head replaces imprecise short rollouts with a direct
-        position evaluation, allowing far more tree nodes per second.
-      - Training on MCTS visit distributions causes the network to learn
-        *what the tree found*, not just what the network originally guessed.
-
-    Tree reuse: the chosen child's subtree is kept between turns.  On the
-    next call to choose_move, _try_reuse_tree promotes the grandchild that
-    matches the opponent's actual reply, so the previous search is not wasted.
-    Priors for all surviving children are refreshed from the new root network
-    call (tactical boost + Dirichlet noise applied as normal).  Reuse is
-    discarded on encirclement (dots removed) or any unexpected board diff.
+    With a fresh network it plays like MCTSPlayer (trust = 0).  As training
+    steps accumulate the policy head re-weights the root priors and the
+    value head pre-rates the top candidates, so the search spends its
+    simulations where the network has learned good moves are.
     """
 
     def __init__(self, player_id: int):
@@ -152,6 +89,9 @@ class NeuralMCTSPlayer(BasePlayer):
         self._opt      = torch.optim.Adam(
             self._net.parameters(), lr=S.NM_LEARNING_RATE
         )
+        # Training steps taken so far (persisted) — drives the trust factor.
+        # A one-element list so self-play partners can share the counter.
+        self._steps: list = [0]
 
         # Episode buffer — one entry per move this player made this game:
         #   (enc_np, legal_mask_flat, visit_dist_flat, root_value_pred)
@@ -164,32 +104,37 @@ class NeuralMCTSPlayer(BasePlayer):
         self._buffer: list[tuple] = []
         self._learning_shared: bool = False
 
-        # Tree reuse: subtree of the move we chose last turn + the board we
-        # expected after playing it (used to diff out the opponent's reply).
-        self._saved_root:  '_NMNode | None' = None
-        self._saved_board: dict | None      = None
+        self._searcher = Searcher(SearchConfig(
+            c_puct=S.NM_C_PUCT,
+            noise_alpha=S.NM_NOISE_ALPHA,
+            noise_frac=S.NM_NOISE_FRAC,
+        ))
+        self.last_search = None
 
         self.load()
 
     # ── BasePlayer interface ──────────────────────────────────────────────────
 
+    def trust(self) -> float:
+        """How much the network steers the search: 0 (untrained) rising
+        linearly to NM_MAX_TRUST after NM_TRUST_STEPS training steps."""
+        return S.NM_MAX_TRUST * min(1.0, self._steps[0] / max(S.NM_TRUST_STEPS, 1))
+
     def choose_move(self, board: dict, connections: set, player: int,
                     scores: dict, forbidden=None) -> tuple[int, int]:
-        from ai.mcts import FastBoard
-
         forbidden = forbidden or set()
-        fb        = FastBoard(board, connections, player, scores, forbidden)
-        legal     = fb.legal_moves()
-        n         = S.GRID
-
-        if not legal:
+        bg = BitGame.from_board(board, player, scores, forbidden)
+        legal = bits(bg.legal())
+        n, W = S.GRID, bg.g.W
+        if bg.done or not legal:
             return (0, 0)
 
-        # ── Encode board and get network output at root ───────────────────────
-        enc          = _encode(board, connections, forbidden, player)
-        legal_mask   = np.zeros(n * n, dtype=bool)
-        for gx, gy in legal:
-            legal_mask[gy * n + gx] = True
+        # ── Network output at the root ────────────────────────────────────────
+        enc        = _encode(board, connections, forbidden, player)
+        legal_mask = np.zeros(n * n, dtype=bool)
+        flat       = {i: (i // W) * n + (i % W) for i in legal}   # bit idx → flat idx
+        for f in flat.values():
+            legal_mask[f] = True
 
         with torch.no_grad():
             x      = torch.tensor(enc, dtype=torch.float32,
@@ -198,153 +143,57 @@ class NeuralMCTSPlayer(BasePlayer):
             rl     = rl[0].clone()
             mask_t = torch.tensor(legal_mask, dtype=torch.bool, device=self._device)
             rl[~mask_t] = float('-inf')
-            root_priors = F.softmax(rl, dim=0).cpu().numpy()   # (G²,) ≈1 over legal
-
+            net_pol = F.softmax(rl, dim=0).cpu().numpy()   # (G²,) ≈1 over legal
         root_val = float(rv[0].item())   # in [-1,1], from player's perspective
 
-        if len(legal) == 1:
-            # Only one move — record and return immediately (no search needed)
-            self._discard_tree()
-            visit_dist = np.zeros(n * n, dtype=np.float32)
-            gx, gy = legal[0]
-            visit_dist[gy * n + gx] = 1.0
-            self._episode.append((enc, legal_mask, visit_dist, root_val))
-            return legal[0]
-
-        # ── Tactical boost on root priors (safety net for untrained network) ──
-        # Exponential formula: exp(k × score) where k = 2·ln(close_boost).
-        # This gives close_boost^(2×score), so:
-        #   score 0.5  →  close_boost^1  ≈   4×
-        #   score 1.0  →  close_boost^2  ≈  16×
-        #   score 2.5  →  close_boost^5  ≈ 1024×
-        # Even a network prior 100× biased toward a triangle cannot override a
-        # 2.5-point square opportunity (1/100 × 1024 > 1 × 4).
-        # Also suppresses dead spots — positions with zero immediate or ring
-        # potential — but only once productive moves exist on the board.
-        game_phase = len(board) / max(n * n, 1)
-        root_priors = self._tactical_priors(
-            root_priors, board, connections, player, legal_mask,
-            suppress_dead=True, game_phase=game_phase)
-
-        # ── Dirichlet noise for exploration ───────────────────────────────────
-        # Prevents deterministic play and ensures diversity in training data.
-        # Adaptive alpha keeps spikiness consistent regardless of board size;
-        # floored at 0.1 to avoid single-spike noise on large open boards.
-        if S.NM_NOISE_FRAC > 0 and len(legal) > 1:
-            alpha = adaptive_dirichlet_alpha(S.NM_NOISE_ALPHA, len(legal))
-            eta   = np.random.dirichlet([alpha] * len(legal))
-            for i, (gx, gy) in enumerate(legal):
-                idx              = gy * n + gx
-                root_priors[idx] = ((1.0 - S.NM_NOISE_FRAC) * root_priors[idx]
-                                    + S.NM_NOISE_FRAC * float(eta[i]))
-
-        # ── Build root with all direct children pre-populated ─────────────────
-        # AlphaZero-style: children already exist with priors from root network
-        # call.  On the first simulation each child immediately gets expanded
-        # (another network call) to populate its own children.
-        # If we can reuse a subtree from the previous turn (grandchild matching
-        # the opponent's reply), we inherit its visit counts and only refresh
-        # the priors with this turn's network output + tactical boost + noise.
-        reused = self._try_reuse_tree(board)
-        if reused is not None and reused.children:
-            # Inherit the searched subtree; refresh priors from THIS turn's
-            # root evaluation (tactical boost + fresh Dirichlet noise) and
-            # add children for any move that wasn't expanded last turn.
-            root = reused
-            root.move = None
-            legal_set = set(legal)
-            root.children = [c for c in root.children if c.move in legal_set]
-            have = {c.move for c in root.children}
-            for c in root.children:
-                gx, gy = c.move
-                c.prior = float(root_priors[gy * n + gx])
-            for gx, gy in legal:
-                if (gx, gy) not in have:
-                    root.children.append(_NMNode(
-                        move=(gx, gy), parent=root, children=None,
-                        player_who_moved=player,
-                        prior=float(root_priors[gy * n + gx])))
-        else:
-            root = _NMNode(move=None, parent=None, children=[],
-                           player_who_moved=3 - player, prior=0.0)
-            for gx, gy in legal:
-                root.children.append(_NMNode(
-                    move=(gx, gy), parent=root, children=None,
-                    player_who_moved=player,
-                    prior=float(root_priors[gy * n + gx])))
-
-        # ── MCTS simulations ──────────────────────────────────────────────────
-        deadline   = time.time() + S.AI_THINK_MS / 1000.0
-        batch_size = getattr(S, 'NM_LEAF_BATCH', 8)
-
-        while time.time() < deadline:
-            pending = []                 # (node, sim_fb) awaiting evaluation
-            for _ in range(batch_size):
-                node, sim_fb = self._select(root, fb.copy())
-
-                if sim_fb.done:
-                    s1, s2 = sim_fb.scores.get(1, 0.0), sim_fb.scores.get(2, 0.0)
-                    total  = (s1 + s2) or 1.0
-                    val01  = (s1 if player == 1 else s2) / total
-                    self._backprop(node, val01, player)
-                    continue
-                if node.children is not None:
-                    # Expanded non-terminal with nothing to descend — neutral.
-                    self._backprop(node, 0.5, player)
-                    continue
-                if node.pending:
-                    # Virtual loss couldn't steer away — batch is saturated.
-                    break
-                node.pending = True
-                self._apply_virtual(node, player, +1)
-                pending.append((node, sim_fb))
-
-            if not pending:
-                continue
-
-            encs = np.stack([
-                _encode(fb_.board, fb_.connections, fb_.forbidden, fb_.player)
-                for _, fb_ in pending])
-            with torch.no_grad():
-                x = torch.tensor(encs, dtype=torch.float32, device=self._device)
-                lg, v = self._net(x)
-
-            for i, (node, fb_) in enumerate(pending):
-                self._apply_virtual(node, player, -1)
-                node.pending = False
-                raw_v = self._expand_with(node, fb_, lg[i], float(v[i].item()))
-                if fb_.player == player:
-                    val01 = (raw_v + 1.0) / 2.0
-                else:
-                    val01 = (1.0 - raw_v) / 2.0
-                self._backprop(node, val01, player)
+        # ── Search ────────────────────────────────────────────────────────────
+        trust = self.trust()
+        res = self._searcher.search(
+            bg, S.AI_THINK_MS / 1000.0,
+            prior_mix={i: float(net_pol[f]) for i, f in flat.items()}
+                      if trust > 0 else None,
+            mix_weight=trust,
+            seed_fn=self._value_seeds if trust > 0 else None)
+        self.last_search = res
 
         # ── Visit distribution for policy training ────────────────────────────
         visit_dist = np.zeros(n * n, dtype=np.float32)
-        total_vis  = max(sum(c.visits for c in root.children), 1)
-        for child in root.children:
-            gx, gy = child.move
-            visit_dist[gy * n + gx] = child.visits / total_vis
+        total_vis  = sum(res.visits.values())
+        if total_vis > 0:
+            for i, v in res.visits.items():
+                visit_dist[flat[i]] = v / total_vis
+        else:
+            visit_dist[flat[res.move]] = 1.0   # no simulations ran
 
         self._episode.append((enc, legal_mask, visit_dist, root_val))
+        return bg.g.xy[res.move]
 
-        # ── Final move: most-visited child ────────────────────────────────────
-        # After many simulations visit counts are much more reliable than
-        # a single network query, so we always use argmax(visits).
-        best = max(root.children, key=lambda c: c.visits)
-
-        # Save the chosen subtree for next turn's reuse
-        best.parent = None
-        self._saved_root = best
-        fb2 = fb.copy(); fb2.play(*best.move)
-        self._saved_board = dict(fb2.board)
-
-        return best.move
+    def _value_seeds(self, bg: BitGame, scores: dict) -> dict:
+        """Rate the positions after the top heuristic candidates with the
+        value head → {idx: (virtual visits, value in [0,1] for the mover)}."""
+        k = S.NM_VALUE_SEEDS
+        top = sorted(scores, key=scores.get, reverse=True)[:k]
+        if not top:
+            return {}
+        encs = []
+        for i in top:
+            after = bg.copy()
+            after.play(i)
+            encs.append(_encode(after.board(), after.connections(),
+                                after.forbidden(), after.player))
+        with torch.no_grad():
+            x = torch.tensor(np.stack(encs), dtype=torch.float32,
+                             device=self._device)
+            _, v = self._net(x)
+        # v is from the opponent's perspective (they are to move).
+        n_vis = S.NM_VALUE_VISITS * self.trust() / max(S.NM_MAX_TRUST, 1e-9)
+        return {i: (n_vis, (1.0 - float(v[j].item())) / 2.0)
+                for j, i in enumerate(top)}
 
     def record_outcome(self, winner: int,
                        intermediate_rewards=None,
                        final_scores: dict | None = None) -> None:
-        self._discard_tree()   # game ended — saved subtree is stale
+        self._searcher.reset()   # game ended — saved subtree is stale
         if not self._episode and not self._obs_episode:
             return
 
@@ -408,6 +257,7 @@ class NeuralMCTSPlayer(BasePlayer):
         (policy target and mask transformed identically; value is invariant)."""
         if not self._buffer:
             return
+        backup = {k: v.clone() for k, v in self._net.state_dict().items()}
         n_steps = (S.NM_TRAIN_STEPS
                    if len(self._buffer) >= S.NM_BATCH_SIZE else 1)
         for _ in range(n_steps):
@@ -457,6 +307,12 @@ class NeuralMCTSPlayer(BasePlayer):
             loss.backward()
             nn.utils.clip_grad_norm_(self._net.parameters(), S.PT_MAX_GRAD_NORM)
             self._opt.step()
+            self._steps[0] += 1
+
+        if not all(torch.isfinite(q).all() for q in self._net.parameters()):
+            # Roll back rather than keep (and save) a dead network.
+            self._net.load_state_dict(backup)
+            self._opt.state.clear()
 
     def share_learning_with(self, other: 'NeuralMCTSPlayer') -> None:
         """Make *other* train and act with this player's network/optimizer."""
@@ -464,6 +320,7 @@ class NeuralMCTSPlayer(BasePlayer):
         other._opt    = self._opt
         other._arch   = self._arch
         other._buffer = self._buffer
+        other._steps  = self._steps
         self._learning_shared = other._learning_shared = True
 
     def observe_opponent_move(self, board, connections, player_who_moved,
@@ -491,8 +348,8 @@ class NeuralMCTSPlayer(BasePlayer):
                 if (bx, by) not in occupied and (bx, by) not in forbidden:
                     mask_np[by * n + bx] = True
 
-        if not mask_np.any():
-            return  # nothing legal — don't record
+        if not mask_np[gy * n + gx]:
+            return  # illegal move (bad replay data) — don't record
 
         enc = _encode(board, connections, forbidden, player_who_moved)
 
@@ -516,6 +373,7 @@ class NeuralMCTSPlayer(BasePlayer):
                 'optim': self._opt.state_dict(),
                 'grid':  S.GRID,
                 'arch':  self._arch,
+                'steps': self._steps[0],
             }, path)
         except OSError:
             pass
@@ -526,201 +384,11 @@ class NeuralMCTSPlayer(BasePlayer):
             return
         try:
             ck = torch.load(path, map_location=self._device, weights_only=False)
-            if (ck.get('grid') == S.GRID and ck.get('arch') == self._arch):
+            if (ck.get('grid') == S.GRID and ck.get('arch') == self._arch
+                    and all(torch.isfinite(t).all()
+                            for t in ck['model'].values())):
                 self._net.load_state_dict(ck['model'])
                 self._opt.load_state_dict(ck['optim'])
+                self._steps[0] = int(ck.get('steps', 0))
         except Exception:
             pass
-
-    # ── Internal MCTS helpers ─────────────────────────────────────────────────
-
-    def _discard_tree(self) -> None:
-        """Clear any saved subtree (called on game end or unexpected board diff)."""
-        self._saved_root  = None
-        self._saved_board = None
-
-    def _try_reuse_tree(self, current_board: dict) -> '_NMNode | None':
-        """Promote the grandchild matching the opponent's actual reply.
-
-        Returns the new root (with inherited visit counts) or None.  Discards
-        on encirclement (dots removed) or any unexpected board diff — same
-        policy as MCTSPlayer._try_reuse_tree.
-        """
-        if self._saved_root is None or self._saved_board is None:
-            return None
-        prev = self._saved_board
-        if any(pos not in current_board for pos in prev):
-            self._discard_tree()
-            return None
-        new_dots = [pos for pos in current_board if pos not in prev]
-        if len(new_dots) != 1:
-            self._discard_tree()
-            return None
-        opp_move = new_dots[0]
-        node = self._saved_root
-        self._discard_tree()
-        if node.children:
-            for child in node.children:
-                if child.move == opp_move:
-                    child.parent = None
-                    return child
-        return None
-
-    def _select(self, root: _NMNode, fb) -> tuple:
-        """Descend tree following PUCT until an unvisited (children=None) node."""
-        node = root
-        while not fb.done:
-            if node.children is None:
-                # Unvisited leaf — stop here for expansion
-                return node, fb
-            if not node.children:
-                # Expanded but empty (terminal detected during expansion)
-                return node, fb
-            # Descend to highest-PUCT child
-            best = max(node.children, key=lambda c: c.puct(S.NM_C_PUCT))
-            fb.play(*best.move)
-            node = best
-        return node, fb
-
-    def _expand_with(self, node: '_NMNode', fb, logits_row, value: float) -> float:
-        """Populate node.children from a precomputed network output row.
-        Returns the value in [-1, 1] from fb.player's perspective."""
-        legal = fb.legal_moves()
-        if not legal:
-            node.children = []
-            return 0.0
-        n    = S.GRID
-        mask = torch.zeros(n * n, dtype=torch.bool, device=self._device)
-        for gx, gy in legal:
-            mask[gy * n + gx] = True
-        lg = logits_row.clone()
-        lg[~mask] = float('-inf')
-        priors = F.softmax(lg, dim=0).cpu().numpy()
-
-        node_phase = len(fb.board) / max(n * n, 1)
-        priors = self._tactical_priors(
-            priors, fb.board, fb.connections, fb.player, mask.cpu().numpy(),
-            suppress_dead=False, game_phase=node_phase)
-
-        node.children = [
-            _NMNode(move=(gx, gy), parent=node, children=None,
-                    player_who_moved=fb.player,
-                    prior=float(priors[gy * n + gx]))
-            for gx, gy in legal
-        ]
-        return value
-
-    def _expand_node(self, node: _NMNode, fb) -> float:
-        """Single-leaf expansion (kept for clarity/compat): one network call.
-
-        Populates node.children with priors from the policy head.
-        Returns raw value in [-1, 1] from fb.player's perspective.
-        """
-        enc = _encode(fb.board, fb.connections, fb.forbidden, fb.player)
-        with torch.no_grad():
-            x = torch.tensor(enc, dtype=torch.float32,
-                             device=self._device).unsqueeze(0)
-            lg, v = self._net(x)
-        return self._expand_with(node, fb, lg[0], float(v[0].item()))
-
-    @staticmethod
-    def _apply_virtual(node: '_NMNode', ai_player: int, sign: int) -> None:
-        """Apply (+1) or revert (-1) a virtual loss along the path to root.
-
-        Pending leaves are temporarily scored as a loss for ai_player so the
-        next selection in the same batch explores a different leaf."""
-        cur = node
-        while cur is not None:
-            cur.visits += sign
-            if cur.player_who_moved != ai_player:
-                cur.total_value += sign      # a win for the opponent
-            cur = cur.parent
-
-    @staticmethod
-    def _tactical_priors(
-        probs: np.ndarray,
-        board: dict,
-        connections: set,
-        player: int,
-        legal_mask: np.ndarray,
-        suppress_dead: bool = True,
-        game_phase: float = 0.0,
-    ) -> np.ndarray:
-        """Tactically-corrected priors for MCTS nodes.
-
-        Two improvements over the old linear apply_boost():
-
-        1. Exponential scoring boost (phase-decayed)
-           Old formula:  1 + (base−1) × score   (linear)
-             score=0.5 → 2.5×,  score=2.5 → 8.5×
-           New formula:  exp(2·ln(base) × score × decay) = base^(2×score×decay)
-             score=0.5 → base^1 ≈  4×  (at game_phase=0)
-             score=1.0 → base^2 ≈ 16×  (at game_phase=0)
-             score=2.5 → base^5 ≈ 1024× (at game_phase=0)
-           A network prior 100× biased toward a 0.5-pt triangle cannot beat
-           a 2.5-pt square: (1/100)×1024 = 10.2  vs  1.0×4 = 4.
-           By game_phase=1.0, decay=0.3, so boost is 30% of maximum —
-           a well-trained network can override it with a ring strategy.
-
-        2. Dead-spot suppression (suppress_dead=True, root only)
-           Positions with zero immediate scoring value AND zero ring-arc
-           potential are divided by NM_DEAD_SPOT_PENALTY.  This is only
-           applied when productive moves already exist on the board, so an
-           empty board is not affected.
-        """
-        own_s, opp_s = opportunity_masks(board, connections, player)
-
-        p        = probs.astype(np.float64)
-        own_leg  = own_s.astype(np.float64) * legal_mask
-        opp_leg  = opp_s.astype(np.float64) * legal_mask
-
-        # Decay tactical boost with game phase so a trained network can
-        # override it late-game. Floor of 0.3 keeps a safety net alive.
-        phase_decay = max(0.3, 1.0 - game_phase)
-        close_k = 2.0 * math.log(max(S.AI_CLOSE_BOOST, 2.0)) * phase_decay
-        block_k = 2.0 * math.log(max(S.AI_BLOCK_BOOST, 2.0)) * phase_decay
-
-        if own_leg.any():
-            p *= np.exp(close_k * own_leg)
-        if opp_leg.any():
-            p *= np.exp(block_k * opp_leg)
-
-        if suppress_dead:
-            own_arc, opp_arc = arc_potential_map(board, player)
-            # A position is "live" if it has direct scoring value OR is
-            # adjacent to an existing ring arc (contributing to a future close).
-            live = (
-                (own_leg > 0) | (opp_leg > 0) |
-                ((own_arc > 0) & legal_mask) |
-                ((opp_arc > 0) & legal_mask)
-            )
-            # Only suppress when productive moves already exist — avoids
-            # penalising every position on a nearly-empty board.
-            if live.any():
-                dead = legal_mask.astype(bool) & ~live
-                if dead.any():
-                    p[dead] /= S.NM_DEAD_SPOT_PENALTY
-
-        total = p[legal_mask.astype(bool)].sum()
-        if total > 0:
-            p /= total
-        else:
-            p = legal_mask.astype(np.float64)
-            p /= p.sum()
-
-        return p.astype(np.float32)
-
-    @staticmethod
-    def _backprop(node: _NMNode, val01: float, ai_player: int) -> None:
-        """Propagate val01 ∈ [0,1] (from ai_player's perspective) up the tree.
-
-        Nodes where ai_player moved get +val01 (good position for ai_player).
-        Nodes where the opponent moved get +(1−val01) (good for them = bad for us).
-        """
-        while node is not None:
-            node.visits += 1
-            if node.player_who_moved == ai_player:
-                node.total_value += val01
-            else:
-                node.total_value += (1.0 - val01)
-            node = node.parent

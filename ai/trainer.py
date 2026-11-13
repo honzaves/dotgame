@@ -278,7 +278,10 @@ class Trainer:
                     legal = game.legal_moves()
                     if not legal:
                         break
-                    game.place(*random.choice(legal))
+                    # Keep `move` in sync so shaping and the opponent's
+                    # observation refer to the move actually played.
+                    move = random.choice(legal)
+                    game.place(*move)
 
                 # Territory delta shaping reward
                 terr_delta = (game.scores.get(cp, 0.0)

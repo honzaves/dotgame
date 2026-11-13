@@ -133,8 +133,11 @@ class ReplayTrainer:
             conn_before  = set(sim.connections)
             forb_before  = set(sim.forbidden)
 
-            # Apply the move to advance sim state
-            sim.place(gx, gy)
+            # Apply the move to advance sim state.  Skip entries that are
+            # not legal here (older recordings could contain rejected
+            # clicks) — feeding them to the players would poison training.
+            if sim.current != player_who_moved or not sim.place(gx, gy):
+                continue
 
             # Notify both players about this move.
             # For each player:

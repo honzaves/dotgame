@@ -49,67 +49,73 @@ class TestBufferTraining:
         assert len(p._buffer) == 4
 
 
-class TestTreeReuse:
-    def _node(self, move, parent, who):
-        from ai.neural_mcts_player import _NMNode
-        return _NMNode(move=move, parent=parent, children=None,
-                       player_who_moved=who)
-
-    def test_promotes_matching_grandchild(self):
-        p = NeuralMCTSPlayer(1); p.save = lambda: None
-        # Hand-built saved subtree: our chosen move (2,2), opponent replies
-        chosen = self._node((2, 2), None, 1)
-        chosen.children = [self._node((3, 3), chosen, 2),
-                           self._node((4, 4), chosen, 2)]
-        chosen.children[0].visits = 7
-        p._saved_root  = chosen
-        p._saved_board = {(2, 2): 1}
-        new_root = p._try_reuse_tree({(2, 2): 1, (3, 3): 2})
-        assert new_root is chosen.children[0]
-        assert new_root.visits == 7
-        assert p._saved_root is None        # state cleared after reuse
-
-    def test_discards_on_removed_dots(self):
-        p = NeuralMCTSPlayer(1); p.save = lambda: None
-        p._saved_root  = self._node((2, 2), None, 1)
-        p._saved_board = {(2, 2): 1, (5, 5): 2}
-        assert p._try_reuse_tree({(2, 2): 1, (0, 0): 2}) is None
-
-    def test_choose_move_saves_subtree(self):
-        S.AI_THINK_MS = 30
-        p = NeuralMCTSPlayer(1); p.save = lambda: None
-        p.choose_move({}, set(), 1, {1: 0.0, 2: 0.0}, set())
-        assert p._saved_root is not None
-        assert p._saved_board is not None
-
-
-class TestVirtualLoss:
-    def test_apply_and_revert_restores_counts(self):
-        from ai.neural_mcts_player import _NMNode, NeuralMCTSPlayer
-        root  = _NMNode(None, None, [], player_who_moved=2)
-        child = _NMNode((1, 1), root, None, player_who_moved=1)
-        root.children = [child]
-        root.visits, root.total_value   = 5, 2.5
-        child.visits, child.total_value = 3, 1.0
-        NeuralMCTSPlayer._apply_virtual(child, ai_player=1, sign=+1)
-        assert (child.visits, root.visits) == (4, 6)
-        NeuralMCTSPlayer._apply_virtual(child, ai_player=1, sign=-1)
-        assert (child.visits, child.total_value) == (3, 1.0)
-        assert (root.visits, root.total_value)   == (5, 2.5)
-
-
-class TestBatchedSearch:
-    def test_choose_move_returns_legal_and_counts_consistent(self):
-        S.AI_THINK_MS = 60
+class TestSearchIntegration:
+    def test_choose_move_records_normalised_visit_distribution(self):
+        S.AI_THINK_MS = 120
         p = NeuralMCTSPlayer(1); p.save = lambda: None
         board = {(4, 4): 2}
         move = p.choose_move(board, set(), 1, {1: 0.0, 2: 0.0}, set())
         assert move not in board
-        root = p._saved_root        # chosen child saved by tree reuse
-        assert root.visits >= 1
-        assert root.visits >= sum(c.visits for c in (root.children or []))
-        def no_negative(n):
-            assert n.visits >= 0
-            for c in (n.children or []):
-                no_negative(c)
-        no_negative(root)
+        enc, mask, dist, val = p._episode[-1]
+        assert enc.shape == (15, S.GRID, S.GRID)
+        assert not mask[4 * S.GRID + 4] and mask.sum() == S.GRID ** 2 - 1
+        assert abs(float(dist.sum()) - 1.0) < 1e-5
+        assert (dist[~mask] == 0).all()
+        assert -1.0 <= val <= 1.0 or np.isfinite(val)
+
+    def test_record_outcome_resets_search_tree(self):
+        S.AI_THINK_MS = 60
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p.choose_move({}, set(), 1, {1: 0.0, 2: 0.0}, set())
+        assert p._searcher._saved is not None
+        p.record_outcome(1, final_scores={1: 5.0, 2: 1.0})
+        assert p._searcher._saved is None
+
+
+class TestTrust:
+    def test_untrained_network_has_no_influence(self):
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p._steps[0] = 0
+        assert p.trust() == 0.0
+
+    def test_trust_grows_with_training_and_saturates(self, monkeypatch):
+        monkeypatch.setattr(S, 'NM_TRUST_STEPS', 100)
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p._steps[0] = 50
+        assert p.trust() == pytest.approx(S.NM_MAX_TRUST / 2)
+        p._steps[0] = 10_000
+        assert p.trust() == S.NM_MAX_TRUST
+
+    def test_training_advances_step_counter(self):
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        before = p._steps[0]
+        _fake_episode(p, steps=3)
+        p.record_outcome(1, final_scores={1: 10.0, 2: 2.0})
+        assert p._steps[0] > before
+
+    def test_partners_share_step_counter(self):
+        p1 = NeuralMCTSPlayer(1); p1.save = lambda: None
+        p2 = NeuralMCTSPlayer(2); p2.save = lambda: None
+        p1.share_learning_with(p2)
+        assert p2._steps is p1._steps
+
+    def test_value_seeds_rate_top_candidates(self, monkeypatch):
+        from ai.engine import BitGame
+        from ai import strategy
+        monkeypatch.setattr(S, 'NM_VALUE_SEEDS', 3)
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p._steps[0] = S.NM_TRUST_STEPS          # full trust
+        bg = BitGame.from_board({(4, 4): 2}, 1)
+        scores = strategy.move_scores(bg)
+        seeds = p._value_seeds(bg, scores)
+        top3 = sorted(scores, key=scores.get, reverse=True)[:3]
+        assert set(seeds) == set(top3)
+        for n, v in seeds.values():
+            assert n == S.NM_VALUE_VISITS and 0.0 <= v <= 1.0
+
+
+class TestIllegalObservation:
+    def test_observed_illegal_move_is_not_recorded(self):
+        p = NeuralMCTSPlayer(1); p.save = lambda: None
+        p.observe_opponent_move({(3, 3): 1}, set(), 2, (3, 3), set())
+        assert p._obs_episode == []

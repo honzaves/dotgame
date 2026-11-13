@@ -80,17 +80,15 @@ Opens at startup and whenever you press `R` or choose New Game. Select a game mo
 On the right:
 
 - **Player name fields** — click a field and type to rename either player.
-- **⚙ SETTINGS** — opens the Settings screen (think time, Deep Terr toggle).
+- **⚙ SETTINGS** — opens the Settings screen (think time, MCTS profile).
 - **◉ AI INFO** — opens the AI Info screen (architecture diagrams).
 - **TRAIN AI →** — opens the training configuration screen.
 
 ### Settings screen
 
-- **MCTS think time** — use `◀` / `▶` to step through presets (10–5000 ms). Applies to all
-  MCTS play and MCTS self-play training.
-- **DEEP TERR toggle** — switches MCTS rollout scoring between fast lightweight mode
-  (~500 rollouts/sec) and full flood-fill territory detection (~5 rollouts/sec, more accurate).
-  Only worth enabling at 2000 ms+ think time.
+- **AI think time** — use `◀` / `▶` to step through presets (10–5000 ms). Applies to every AI
+  type: longer thinking means more simulated games per move.
+- **MCTS personality profile** — Default, Opportunist or Strategist for single-MCTS games.
 
 ### AI Info screen
 
@@ -126,34 +124,45 @@ below) so they play meaningfully different styles rather than mirroring each oth
 
 ## AI players
 
+All four AIs share one foundation (new in this version):
+
+- **Exact engine** (`ai/engine.py`) — a bitboard implementation of the real rules (flood-fill
+  territory, half-point triangles, encirclement captures, forbidden points, both win
+  conditions) that is fast enough to simulate thousands of full games per second. The AIs see a
+  40-cell ring closing exactly as they see a unit square closing.
+- **Ring-race analysis** (`ai/rings.py`) — the decisive plan in Dot Grid is a big ring: enclose
+  half the board and you win on the spot. The analysis computes, for each player, how many more
+  dots are needed to close a winning ring, and which points those rings pass through.
+- **Move scoring** (`ai/strategy.py`) — every legal move is scored by its exact one-move result
+  (territory gained, opponent territory destroyed, opponent threats left standing) plus the ring
+  race after the move. Taking a point only counts as a block if the opponent's ring really gets
+  longer — a ring that simply steps around the dot is not delayed.
+
 ### MCTS (Monte Carlo Tree Search)
 
-Runs tree search within the configured time budget. Uses PUCT priors built from eight strategic
-signals: immediate close, opponent block, territory setup, arc extension, arc block, arc bridge,
-cluster growth, and centrality. Rollouts follow a six-tier biased policy (fork → close → block →
-setup → adjacent → random). Leaf positions are evaluated with a four-signal blend that weights
-arc potential at 50%.
+Runs a PUCT tree search within the configured time budget (`ai/search.py`). The move scores above
+decide which moves the tree explores first; every simulation is then a **full game played to the
+end with the exact rules**, and the results decide. The most-visited move is played and its
+subtree is reused next turn.
 
-**Arc potential** uses a bounding-box × completion-ratio formula that grows continuously as a ring
-is built, unlike older flood-fill approaches that return zero until ring completion. This gives
-MCTS genuine ring-building instincts from the very first arc placed.
-
-**Dirichlet noise** is injected into root priors each turn (adaptive alpha, 25% weight by default)
-so games are varied and non-deterministic.
+**Parallel search:** on a multi-core machine the simulations also run in background worker
+processes (`ai/parallel.py`, `SEARCH_WORKERS`), multiplying the number of games played per move.
+The workers start on the first AI move and exit with the game.
 
 **MCTS vs MCTS personality profiles:** when two MCTS instances face each other they receive
 distinct profiles from `settings.py`:
 
-| Profile | Style | Close weight | Arc weight | Noise frac | Exploration |
-|---------|-------|-------------|------------|------------|-------------|
-| 1 — Opportunist | Grabs immediate territory, plays noisily | 5.5 | 2.5 | 0.35 | 1.20 |
-| 2 — Strategist | Builds large rings, explores patiently | 2.5 | 7.0 | 0.18 | 1.65 |
+| Profile | Style | Race weight | Potential weight | Gain weight | Noise frac | Exploration |
+|---------|-------|-------------|------------------|-------------|------------|-------------|
+| 1 — Opportunist | Values immediate territory swings | 0.8 | 1.0 | 3.5 | 0.25 | 1.3 |
+| 2 — Strategist | Values the ring race and ring potential | 1.2 | 2.2 | 1.5 | 0.10 | 1.7 |
 
-Experience (`board_key → {wins, visits}`) is saved between games to warm-start future searches.
+**Opening book:** outcomes of finished games are stored per position (shared across the 8 board
+symmetries) and seed the search in the first few moves.
 
-- Experience file: `ai_experience_<GRID>x<GRID>.json`
+- Experience file: `ai_experience_<GRID>x<GRID>.json` (format version 2 — older files are ignored)
 - **1000 ms (default)** provides a strong opponent; lower values are faster but weaker.
-- Deep Terr mode is now in the **Settings screen**, not the side panel.
+- No training required.
 
 ### Neural Network (pure numpy)
 
@@ -166,6 +175,9 @@ over-learning small immediate captures at the expense of strategic large-ring pl
 - **Trunk:** hidden layers auto-scaled by board size, ReLU activations
 - **Policy head:** GRID² logits → masked softmax
 - **Value head:** scalar estimate → tanh output in [-1, 1]
+- **Guidance:** the exact move scores are added to the logits (`AI_GUIDE_TEMP`), at play time and
+  at training time alike — an untrained network already plays close to the best heuristic move,
+  and training refines it from there
 - **Training:** GAE advantages (λ=0.95), entropy bonus (0.01), territory-delta shaping
   (`REWARD_TERRITORY = 0.05`), arc-potential-delta shaping (`REWARD_ARC_SHAPING = 0.10`),
   margin-based terminal value `(own_score − opp_score) / total_fields`
@@ -177,41 +189,39 @@ A **residual CNN actor-critic** trained with **PPO + GAE** and the same dual sha
 the Neural Network.
 
 - **Input:** (15, GRID, GRID) — same 15 channels in spatial layout
-- **Stem:** Conv2d(15→64, 3×3) → BatchNorm → ReLU
-- **Tower:** N × ResBlock(64ch) — Conv→BN→ReLU→Conv→BN + skip → ReLU
+- **Stem:** Conv2d(15→64, 3×3) → GroupNorm → ReLU
+- **Tower:** N × ResBlock(64ch) — Conv→GN→ReLU→Conv→GN + skip → ReLU
 - **Policy head:** Conv(64→2, 1×1) → flatten → Linear(2G²→G²)
 - **Value head:** Conv(64→1, 1×1) → flatten → Linear(G²→64) → ReLU → Linear(64→1)
 - **Training:** PPO clipped surrogate, GAE (λ=0.95), 4 epochs per game, gradient clipping,
   territory-delta and arc-potential-delta shaping, margin-based terminal value
+- **Guidance:** same exact move scores added to the logits as the Neural Network
+- **Safety:** weight files containing NaN are rejected on load, and an update that produces
+  non-finite weights is rolled back
 - Weights file: `pt_weights_<GRID>x<GRID>.pt`
 
 All AI types use **separate experience files per grid size** — changing `GRID` never corrupts
 existing weights.
 
-### Neural MCTS — AlphaZero-style (requires `pip install torch`)
+### Neural MCTS (requires `pip install torch`)
 
-The strongest AI. Combines MCTS tree search with a trained residual CNN, fixing the core weakness
-of each: MCTS gets a learned prior instead of hand-crafted signals, and the CNN gets genuine
-lookahead instead of reacting to the current board alone.
+The MCTS search plus a residual CNN that learns from it.
 
-- **Input:** (15, GRID, GRID) — same 15 channels as PyTorch Net, in spatial layout
+- **Search:** identical to the MCTS player (exact engine, ring-race priors, full-game playouts)
+- **Network at the root:** the policy head is blended into the root priors, and the value head
+  rates the positions after the `NM_VALUE_SEEDS` best candidate moves
+- **Trust:** both contributions are scaled by a trust factor that rises from 0 to `NM_MAX_TRUST`
+  over the first `NM_TRUST_STEPS` training steps — an untrained network cannot mislead the search
+  (the player then plays exactly like MCTS), a trained one increasingly steers it
 - **Architecture:** identical residual CNN to PyTorch Net (same presets, separate weight file)
-- **Search:** AlphaZero PUCT — `Q + c_puct · P · √N_parent / (1 + N_child)`
-  - Policy head output → PUCT prior for each child (replaces hand-crafted `raw_priors`)
-  - Value head output → leaf evaluation (replaces random rollouts entirely)
-  - No rollouts at all: one network call per new leaf, then backpropagate the value
 - **Training signal:** two targets per position
-  - *Policy target:* MCTS visit distribution `π_mcts` — more accurate than the raw network prior
-  - *Value target:* GAE returns (territory + arc shaping, same as PT) blended with the final
-    outcome `z` by `NM_Z_WEIGHT`
+  - *Policy target:* the search's visit distribution
+  - *Value target:* GAE returns (territory + arc shaping) blended with the final outcome `z` by
+    `NM_Z_WEIGHT`
 - **Replay buffer:** finished games land in an in-memory buffer (`NM_BUFFER_MAX` samples);
   each game triggers `NM_TRAIN_STEPS` minibatches of `NM_BATCH_SIZE`, every sampled item
   getting a random board rotation/mirror (`NM_AUGMENT` — 8× sample efficiency)
-- **Loss:** `NM_POLICY_COEF · CE(π_mcts, π_net) + NM_VALUE_COEF · MSE(v, target) − entropy`
-- No PPO needed — visit distributions are a stable supervised signal, not a self-bootstrapped estimate
-- **Search speed:** leaves are evaluated in batches of `NM_LEAF_BATCH` per network call
-  (virtual loss spreads the batch across the tree), and the chosen subtree is reused next turn
-- **Self-improvement loop:** stronger network → better priors + leaf values → better search → better training data → stronger network
+- **Loss:** `NM_POLICY_COEF · CE(π_search, π_net) + NM_VALUE_COEF · MSE(v, target) − entropy`
 - Weights file: `nm_weights_<GRID>x<GRID>.pt`
 
 ---
@@ -276,33 +286,31 @@ self-play games at full speed in a background thread.
 | Opponent | Self / MCTS / Neural Net / PyTorch Net / Neural MCTS | Who it plays against |
 | Think time (ms) | 10 – 5000 | Per-move budget during training |
 | Rounds | 10 – 5000 | Number of games to simulate |
-| DEEP TERR | ON / OFF | Full territory in MCTS rollouts (slow but accurate) |
 
 ### Recommended training workflow
 
-**1. Warm up MCTS first.**
-Train `MCTS vs MCTS` at **500 ms, 50–100 rounds**. Builds a solid opening book and improves
-position win-rate estimates. No neural-network training required for a noticeably better MCTS.
+MCTS needs no training — it is strong out of the box. Training matters for the three network
+players.
 
-**2. Train Neural Net against MCTS.**
-Select `Neural Net`, opponent `MCTS`, **100–500 ms, 200+ rounds**. Playing against a competent
-teacher gives much better signal than pure self-play from random initialisation. The arc-potential
-shaping reward means ring-building behaviour now emerges earlier in training.
+**1. (Optional) Let MCTS build an opening book.**
+`MCTS vs MCTS` at **500 ms, 50–100 rounds** fills the experience file with opening results.
 
-**3. Train PyTorch Net against MCTS or itself.**
-Select `PyTorch Net`, opponent `MCTS`, **200 ms, 100–500 rounds** to get started. PPO is stable
-enough for `Self` play too, but MCTS accelerates early learning.
+**2. Train Neural Net / PyTorch Net against MCTS.**
+Opponent `MCTS`, **100–500 ms, 200+ rounds**. Both networks start from the exact move scores, so
+they play sensibly from the first game; training against a strong teacher teaches them where
+the heuristic is wrong. Below 150 ms the AIs switch to a cheaper analysis — fine for bulk
+training, weaker for play.
 
-**4. Bootstrap Neural MCTS against MCTS, then switch to self-play.**
-Select `Neural MCTS`, opponent `MCTS`, **200–500 ms, 100–200 rounds**. The MCTS opponent provides
-a solid teacher during the early phase when the network is essentially random. Once Neural MCTS
-starts winning consistently against MCTS, switch to `Self` play to enter the self-improvement
-loop — each game's visit distributions become training targets that push the network to replicate
-what the tree found, which then makes the tree even better.
+**3. Train Neural MCTS by self-play or against MCTS.**
+**200–500 ms, 150+ rounds**. Every game adds `NM_TRAIN_STEPS` training steps; after
+`NM_TRUST_STEPS` (600 by default, i.e. ~150 games) the network has full influence on the search.
 
-**5. Keep grid size fixed while training.**
-Experience files are tied to `GRID`. Changing it in `settings.py` causes old NN/PT/NM weights to
-be ignored. MCTS experience is grid-stamped and always compatible.
+**4. Keep grid size fixed while training.**
+Weight and experience files are tied to `GRID`.
+
+**Checking strength:** `python scripts/arena.py mcts ringbot --games 10 --think 500` plays
+headless matches between any two AIs or scripted opponents (`ringbot` builds one big ring and
+never defends — the plan that used to beat every AI).
 
 ---
 
@@ -315,17 +323,27 @@ be ignored. MCTS experience is grid-stamped and always compatible.
 | `AI_THINK_PRESETS` | `[10,100,500,…,5000]` | Available think-time values (ms) |
 | `AI_THINK_DEFAULT` | 1000 | Think time at startup |
 | `AI_MAX_EXPERIENCE` | 20 000 | Max MCTS position entries before pruning |
-| `MCTS_REAL_ROLLOUT` | `False` | Full flood-fill per simulated move (slow) |
-| `MCTS_PRIOR_WEIGHT` | 2.0 | PUCT prior weight in UCB formula |
-| `MCTS_SELECTION_TERRITORY_WEIGHT` | 0.3 | Territory blend in final move selection (default profile) |
 | `MCTS_NOISE_ALPHA` | 0.3 | Dirichlet noise concentration (default profile) |
-| `MCTS_NOISE_FRAC` | 0.25 | Noise fraction of prior (default profile; 0 = off) |
+| `MCTS_NOISE_FRAC` | 0.10 | Noise fraction of prior (default profile; 0 = off) |
 | `MCTS_PROFILES` | see code | Per-instance weight profiles for MCTS vs MCTS |
-| `AI_CLOSE_BOOST` | 4.0 | Post-policy multiplier for territory-closing moves |
-| `AI_BLOCK_BOOST` | 3.0 | Post-policy multiplier for opponent-blocking moves |
-| `AI_FORK_BOOST` | 2.5 | Boost for fork moves |
-| `AI_BRIDGE_BOOST` | 2.0 | Boost for arc-bridging moves |
-| `AI_DISRUPT_BOOST` | 1.8 | Boost for disruption moves |
+| `MCTS_BOOK_MAX_DOTS` | 12 | Opening book is consulted while the board has at most this many dots |
+| `MCTS_BOOK_MAX_VISITS` | 12 | Max virtual visits a remembered position seeds |
+| `RING_DISCOUNT` | 0.92 | Value of a ring decays by this factor per dot still missing |
+| `RACE_STEEPNESS` | 1.2 | How sharply a lead in the ring race counts |
+| `STRAT_RACE_W` | 1.0 | Move-score weight: ring-race outlook |
+| `STRAT_POTENTIAL_W` | 1.5 | Move-score weight: ring potential difference |
+| `STRAT_GAIN_W` | 2.0 | Move-score weight: exact territory swing of the move |
+| `STRAT_THREAT_W` | 2.0 | Move-score weight: opponent's best remaining one-move swing |
+| `SEARCH_C_PUCT` | 1.5 | PUCT exploration constant |
+| `SEARCH_PRIOR_TEMP` | 0.25 | Softmax temperature turning move scores into priors |
+| `SEARCH_WORKERS` | `None` | Worker processes for parallel search: `None` = automatic (cores − 2, max 8), `0` = off |
+| `SEARCH_PARALLEL_MIN_S` | 0.20 | Searches shorter than this stay single-process |
+| `SEARCH_FAST_BELOW_S` | 0.15 | Think times below this use the cheap analysis |
+| `AI_GUIDE_TEMP` | 0.015 | NN/PT: temperature of the move-score guidance added to the logits |
+| `AI_GUIDE_CLIP` | 12.0 | NN/PT: maximum suppression of a move by the guidance |
+| `AI_NET_LOGIT_BOUND` | 3.0 | NN/PT: the network's own logits are squashed to ± this before guidance is added |
+| `AI_CLOSE_BOOST` | 4.0 | Legacy boost (unused by the players) |
+| `AI_BLOCK_BOOST` | 3.0 | Legacy boost (unused by the players) |
 | `AI_EXPERIENCE_BASE` | `../ai_experience` | MCTS file base path |
 | `NN_EXPERIENCE_BASE` | `../nn_weights` | NN weights base path |
 | `NN_HIDDEN_OVERRIDE` | `None` | Force specific NN hidden sizes |
@@ -355,13 +373,16 @@ be ignored. MCTS experience is grid-stamped and always compatible.
 | `NM_ENTROPY_COEF` | 0.01 | Entropy bonus weight |
 | `NM_C_PUCT` | 1.5 | PUCT exploration constant |
 | `NM_NOISE_ALPHA` | 0.3 | Dirichlet noise concentration at root |
-| `NM_NOISE_FRAC` | 0.25 | Fraction of root prior that comes from noise |
+| `NM_NOISE_FRAC` | 0.15 | Fraction of root prior that comes from noise |
+| `NM_MAX_TRUST` | 0.5 | Max weight of the policy head in the root priors |
+| `NM_TRUST_STEPS` | 600 | Training steps until the network gets full trust |
+| `NM_VALUE_SEEDS` | 8 | Top candidate moves rated by the value head |
+| `NM_VALUE_VISITS` | 6 | Virtual visits per rated move at full trust |
 | `NM_BUFFER_MAX` | 8000 | Replay-buffer size (training samples kept in memory) |
 | `NM_BATCH_SIZE` | 256 | Minibatch size per training step |
 | `NM_TRAIN_STEPS` | 4 | Minibatches sampled per finished game |
 | `NM_Z_WEIGHT` | 0.5 | Final-outcome blend in NM value targets |
 | `NM_AUGMENT` | `True` | Random D4 board transform per sampled training item |
-| `NM_LEAF_BATCH` | 8 | Leaves evaluated per batched network call |
 | `PLAYER_NAMES` | `{1:"Player I",…}` | Default display names |
 
 ---
@@ -379,11 +400,16 @@ game_mode.py        Mode enum and player name resolution
 
 ai/
   base_player.py        Abstract BasePlayer interface
-  features.py           All board encoding and strategic signal computation
-  mcts.py               MCTS (per-instance profiles, PUCT priors, 6-tier rollouts, Dirichlet noise)
+  engine.py             Exact bitboard game engine used by all AI simulation
+  rings.py              Ring-race analysis (dots needed for a winning ring)
+  strategy.py           Move scoring: exact tactics + ring race; guidance for the networks
+  search.py             PUCT tree search with full-game playouts
+  parallel.py           Worker processes that run search simulations on other cores
+  features.py           Board-encoding channels for the neural networks
+  mcts.py               MCTS player (search + profiles + opening book)
   nn_player.py          Actor-critic policy network (pure numpy, 15-channel input)
   pytorch_player.py     Residual CNN + PPO + GAE (requires torch, 15-channel input)
-  neural_mcts_player.py AlphaZero-style MCTS guided by residual CNN (requires torch)
+  neural_mcts_player.py Search steered by a residual CNN that learns from it (requires torch)
   runner.py             Background thread wrapper — keeps pygame loop responsive
   trainer.py            Offline self-play trainer (territory + arc shaping rewards)
   paths.py              Grid-stamped experience file path helper

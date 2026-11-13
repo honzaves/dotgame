@@ -43,7 +43,8 @@ class TestPTBoostConsistency:
         x = torch.tensor(enc, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             logits, _ = p._net(x)
-        logits = logits[0] + torch.tensor(boost)
+        from ai.pytorch_player import _bound
+        logits = _bound(logits[0]) + torch.tensor(boost)
         logits[~torch.tensor(mask)] = float('-inf')
         log_p = torch.log_softmax(logits, dim=0)
         assert abs(float(log_p[action]) - lp_old) < 1e-5

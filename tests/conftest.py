@@ -6,7 +6,12 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import settings as S
 import state
+
+# Keep the test suite single-process; tests/test_parallel.py turns the
+# search workers on explicitly.
+S.SEARCH_WORKERS = 0
 
 
 @pytest.fixture(autouse=False)

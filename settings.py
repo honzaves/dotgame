@@ -26,6 +26,7 @@ WIN_PCT             = 0.50
 # MCTS AI
 AI_THINK_PRESETS    = [10, 100, 500, 1000, 1500, 2000, 3000, 5000]
 AI_THINK_DEFAULT    = 1000      # must be one of the presets above
+AI_THINK_MS         = AI_THINK_DEFAULT   # current thinking time (set from the UI at runtime)
 AI_EXPERIENCE_BASE  = "../ai_experience"       # grid size appended at runtime
 AI_MAX_EXPERIENCE   = 20_000
 REPLAY_BUFFER_MAX   = 20    # max human games stored for replay training
@@ -102,51 +103,51 @@ REWARD_ARC_SHAPING  = 0.10         # reward per unit increase in arc_potential (
 # Used to differentiate MCTS vs MCTS games so the two players pursue distinct
 # strategies rather than mirroring each other.
 #
-# Profile 1 — "Opportunist": prefers immediate territory grabs, explores widely
-# Profile 2 — "Strategist":  prefers building large rings, more patient
+# Profile 1 — "Opportunist": values immediate territory swings higher
+# Profile 2 — "Strategist":  values the ring race and ring potential higher
 #
-# Each profile overrides the raw_priors weights and noise params in mcts.py.
-#
-# arc_w / bridge_w are in territory-cell units (NOT normalised by board size).
-# Calibration guide:
-#   arc_w = 0.22  →  9-cell ring scores 1.98 ≈ 0.5 × single close (neutral)
-#   arc_w = 0.08  →  9-cell ring scores 0.72 ≪ close_w=5.5   (Opportunist: ignore rings)
-#   arc_w = 0.55  →  9-cell ring scores 4.95 > close_w=2.5   (Strategist: prefer rings)
-#                    16-cell ring scores 8.80 ≫ close_w=2.5   (Strategist: dominate)
+# Each profile overrides the move-scoring weights (STRAT_* further below),
+# the PUCT exploration constant and the root-noise parameters.  Missing keys
+# fall back to the global defaults.
 MCTS_PROFILES = {
-    1: dict(close_w=5.5, block_w=4.5, arc_w=0.08, bridge_w=0.05, setup_w=1.8,
-            adj_w=1.2, centrality_w=0.4, disrupt_w=0.2,
-            arc_opp_w=0.20, bridge_opp_w=0.12,
-            noise_alpha=0.50, noise_frac=0.35, exploration=1.20,
-            sel_terr_w=0.20,
-            eval_terr_w=0.40, eval_enc_w=0.25),   # rollout: care about immediate terr
-    2: dict(close_w=2.5, block_w=2.0, arc_w=0.55, bridge_w=0.42, setup_w=3.5,
-            adj_w=2.0, centrality_w=0.6, disrupt_w=0.5,
-            arc_opp_w=0.60, bridge_opp_w=0.45,
-            noise_alpha=0.12, noise_frac=0.18, exploration=1.65,
-            sel_terr_w=0.45,
-            eval_terr_w=0.10, eval_enc_w=0.70),   # rollout: care about ring potential
+    1: dict(race_w=0.8, potential_w=1.0, gain_w=3.5, threat_w=3.0,
+            noise_alpha=0.50, noise_frac=0.25, exploration=1.3),
+    2: dict(race_w=1.2, potential_w=2.2, gain_w=1.5, threat_w=2.0,
+            noise_alpha=0.30, noise_frac=0.10, exploration=1.7),
 }
-# Profile 0 = use global S.MCTS_* settings unchanged (default for single MCTS)
+# Profile 0 = global defaults (for single MCTS)
 MCTS_DEFAULT_PROFILE  = 0
 MCTS_PROFILE_LABELS   = {0: "Default", 1: "Opportunist", 2: "Strategist"}
 
-# MCTS algorithm tuning
-MCTS_PRIOR_WEIGHT                = 2.0   # PUCT prior weight (higher = more territory-biased exploration)
-MCTS_SELECTION_TERRITORY_WEIGHT  = 0.3   # territory weight in final move selection
+# Dirichlet exploration noise mixed into the MCTS root priors each turn —
+# keeps self-play games from repeating.  The playouts are random anyway, so
+# a little goes a long way.
+# alpha: concentration parameter — lower = spikier noise
+# frac:  fraction of the prior that comes from noise (0 = off)
+MCTS_NOISE_ALPHA  = 0.3
+MCTS_NOISE_FRAC   = 0.10
 
-# Dirichlet exploration noise injected into root priors each turn.
-# Prevents deterministic/mirror play between two MCTS instances.
-# alpha: concentration parameter — lower = spikier noise (more diverse)
-#   0.3 is the AlphaZero value for Go; good range for Dot Grid is 0.15–0.5
-# frac: fraction of prior that comes from noise vs computed signal
-#   0.25 means 75% prior + 25% noise — enough to diversify without drowning signal
-MCTS_NOISE_ALPHA  = 0.3   # Dirichlet α — controls noise spike shape
-MCTS_NOISE_FRAC   = 0.25  # weight of noise vs computed prior (0 = off, 1 = pure noise)
+# MCTS opening book (experience file): positions with at most this many dots
+# are looked up, and remembered results seed at most this many virtual visits.
+MCTS_BOOK_MAX_DOTS   = 12
+MCTS_BOOK_MAX_VISITS = 12
 
-# Move-selection boosts (applied post-policy to all three AI types)
+# Legacy multiplier boosts (ai/features.apply_boost / boost_log_offsets).
+# The players now use strategy.guidance_offsets() instead.
 AI_CLOSE_BOOST      = 4.0          # multiplier for moves that close a unit square
 AI_BLOCK_BOOST      = 3.0          # multiplier for moves that block opponent closing
+
+# Policy guidance for the policy-network players (NN, PyTorch): the exact
+# move scores of ai/strategy.py are added to the network's logits as
+# (score − best) / AI_GUIDE_TEMP.  Lower temperature = play closer to the
+# best heuristic move; the clip bounds how far a move can be suppressed so
+# training can still reach it.
+AI_GUIDE_TEMP       = 0.015
+AI_GUIDE_CLIP       = 12.0
+# The network's own logits are squashed to ±AI_NET_LOGIT_BOUND (C·tanh(x/C))
+# before the guidance is added, so a badly trained network can re-rank
+# reasonable moves but can never drag a blunder (guidance ≈ −CLIP) to the top.
+AI_NET_LOGIT_BOUND  = 3.0
 
 # Player display names (shown in the UI)
 PLAYER_NAMES        = {1: "Player I", 2: "Player II"}
@@ -163,21 +164,12 @@ C_GOLD      = (201, 168,  76)
 C_TEXT      = (200, 194, 188)
 C_DIM       = ( 90,  88,  85)
 
-# MCTS rollout territory detection
-# False = fast lightweight square-counting (default)
-# True  = full flood-fill territory engine (accurate but ~10× slower per move)
-MCTS_REAL_ROLLOUT   = False
-
-# Additional move-boost signals (applied post-policy alongside AI_CLOSE/BLOCK_BOOST)
-AI_FORK_BOOST       = 2.5   # bonus for moves that create 2+ simultaneous threats
-AI_BRIDGE_BOOST     = 2.0   # bonus for moves that bridge two own ring arcs
-AI_DISRUPT_BOOST    = 1.8   # bonus for moves that reduce opponent enclosure potential
-
-# ── Neural MCTS (AlphaZero-style — requires: pip install torch) ───────────────
+# ── Neural MCTS (requires: pip install torch) ────────────────────────────────
 #
-# Uses the same residual CNN architecture as PyTorchPlayer but guides a MCTS
-# tree with it: policy head → PUCT priors, value head → leaf evaluation.
-# Trains on MCTS visit distributions (more stable than raw policy targets).
+# Runs the same exact-rules tree search as the MCTS player and trains the
+# residual CNN (same architecture as PyTorchPlayer) on its results: policy
+# head ← visit distributions, value head ← outcomes.  The network steers the
+# root of the search in proportion to how much it has been trained.
 # Uses separate weight files so PyTorchPlayer weights are never affected.
 NM_EXPERIENCE_BASE  = "../nm_weights"          # grid-stamped weight file base path
 
@@ -190,15 +182,18 @@ NM_ENTROPY_COEF     = 0.01             # entropy bonus (exploration during train
 
 NM_C_PUCT           = 1.5              # PUCT exploration constant (higher = more diverse)
 NM_NOISE_ALPHA      = 0.3              # Dirichlet noise concentration at root
-NM_NOISE_FRAC       = 0.25             # fraction of root prior that comes from noise
-NM_DEAD_SPOT_PENALTY = 5.0             # divide prior of positions with zero territorial potential
+NM_NOISE_FRAC       = 0.15             # fraction of root prior that comes from noise
+
+NM_MAX_TRUST        = 0.5              # max weight of the policy head in the root priors
+NM_TRUST_STEPS      = 600              # training steps until the network gets full trust
+NM_VALUE_SEEDS      = 8                # top candidate moves rated by the value head
+NM_VALUE_VISITS     = 6                # virtual visits per rated move at full trust
 
 NM_BUFFER_MAX       = 8000             # max (state, π, v) samples kept in memory
 NM_BATCH_SIZE       = 256              # minibatch size per training step
 NM_TRAIN_STEPS      = 4                # minibatches sampled per finished game
 NM_Z_WEIGHT         = 0.5             # blend of final outcome z into value target
 NM_AUGMENT          = True             # random D4 transform per sampled item
-NM_LEAF_BATCH       = 8                # leaves evaluated per batched network call
 
 NM_OVERRIDE         = None             # override architecture: {'blocks':4,'channels':64}
 
@@ -207,3 +202,22 @@ def nm_arch():
     if NM_OVERRIDE is not None:
         return dict(NM_OVERRIDE)
     return _pick(_PT_PRESETS, {'blocks': 8, 'channels': 128})
+
+# ── Strategic evaluation (ai/strategy.py — shared by all AI players) ─────────
+#
+# The AIs measure the "ring race": how many more dots each player needs to
+# close a ring that wins the game (ai/rings.py), and score moves by how they
+# change it, plus exact one-move tactics from the bitboard engine.
+RING_DISCOUNT       = 0.92    # value of a ring decays by this factor per dot still missing
+RACE_STEEPNESS      = 1.2     # how sharply a lead in the ring race counts (grows near closure)
+STRAT_RACE_W        = 1.0     # weight: ring-race outlook after the move, in (-1, 1)
+STRAT_POTENTIAL_W   = 1.5     # weight: ring potential difference (fraction of the board)
+STRAT_GAIN_W        = 2.0     # weight: exact territory swing of the move (fraction of the board)
+STRAT_THREAT_W      = 2.0     # weight: opponent's best remaining one-move swing
+
+# ── Tree search (ai/search.py — the engine of the MCTS and Neural MCTS players) ──
+SEARCH_C_PUCT            = 1.5    # PUCT exploration constant
+SEARCH_PRIOR_TEMP        = 0.25   # softmax temperature turning move scores into priors
+SEARCH_WORKERS           = None   # worker processes for parallel search: None = automatic (cores − 2, max 8), 0 = off
+SEARCH_PARALLEL_MIN_S    = 0.20   # searches with less time left than this stay single-process
+SEARCH_FAST_BELOW_S      = 0.15   # thinking times below this (on 10×10; scaled by (GRID/10)³) use the cheap analysis

@@ -265,14 +265,14 @@ def main():
             board_snap     = dict(state.board)
             conn_snap      = set(state.connections)
             forbidden_snap = set(state.forbidden_positions)
-            state.place(*move)
-            current_game_moves.append([cp, move[0], move[1]])
-            # Symmetric learning: other player observes the position they'll
-            # now face, from their own encoding perspective.
-            opp_runner = runners.get(3 - cp)
-            if opp_runner and not gm.human_controls(3 - cp):
-                opp_runner.observe_opponent_move(
-                    board_snap, conn_snap, cp, move, forbidden_snap)
+            if state.place(*move):
+                current_game_moves.append([cp, move[0], move[1]])
+                # Symmetric learning: other player observes the position
+                # they'll now face, from their own encoding perspective.
+                opp_runner = runners.get(3 - cp)
+                if opp_runner and not gm.human_controls(3 - cp):
+                    opp_runner.observe_opponent_move(
+                        board_snap, conn_snap, cp, move, forbidden_snap)
             if state.game_over:
                 for r in runners.values():
                     r.on_game_end(state.winner_player,
@@ -444,8 +444,6 @@ def main():
                             think_idx = min(len(think_presets) - 1, think_idx + 1)
                             think_ms  = think_presets[think_idx]
                             S.AI_THINK_MS = think_ms
-                        elif deep_r.collidepoint(pos):
-                            S.MCTS_REAL_ROLLOUT = not S.MCTS_REAL_ROLLOUT
                         elif prev_prof.collidepoint(pos):
                             game_mcts_profile = max(0, game_mcts_profile - 1)
                         elif next_prof.collidepoint(pos):
@@ -464,8 +462,6 @@ def main():
                         if back_r.collidepoint(pos):
                             training_mode = False
                             picking_mode  = True
-                        elif train_deep_r.collidepoint(pos):
-                            S.MCTS_REAL_ROLLOUT = not S.MCTS_REAL_ROLLOUT
                         elif replay_r and replay_r.collidepoint(pos):
                             # Replay saved human games through current runners
                             from ai.game_recorder import count_games
@@ -683,14 +679,17 @@ def main():
                             board_snap     = dict(state.board)
                             conn_snap      = set(state.connections)
                             forbidden_snap = set(state.forbidden_positions)
-                            state.place(*hover)
-                            current_game_moves.append([human_cp, hover[0], hover[1]])
-                            # AI opponent observes the human's move
-                            opp_runner = runners.get(3 - human_cp)
-                            if opp_runner and not gm.human_controls(3 - human_cp):
-                                opp_runner.observe_opponent_move(
-                                    board_snap, conn_snap,
-                                    human_cp, hover, forbidden_snap)
+                            # A rejected click (occupied / forbidden point)
+                            # must not be recorded or shown to the AI as a move.
+                            if state.place(*hover):
+                                current_game_moves.append(
+                                    [human_cp, hover[0], hover[1]])
+                                # AI opponent observes the human's move
+                                opp_runner = runners.get(3 - human_cp)
+                                if opp_runner and not gm.human_controls(3 - human_cp):
+                                    opp_runner.observe_opponent_move(
+                                        board_snap, conn_snap,
+                                        human_cp, hover, forbidden_snap)
                             if state.game_over:
                                 for r in runners.values():
                                     r.on_game_end(state.winner_player,

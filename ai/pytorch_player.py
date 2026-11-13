@@ -29,8 +29,9 @@ import numpy as np
 import settings as S
 from ai.base_player import BasePlayer
 from ai.paths import experience_path
-from ai.features import (opportunity_masks, boost_log_offsets,
+from ai.features import (opportunity_masks,
                           arc_potential_map, strategic_channels)
+from ai.strategy import guidance_offsets
 
 _TORCH_AVAILABLE = False
 try:
@@ -100,6 +101,12 @@ def encode_state(board: dict, connections: set,
     out[14] = cent.reshape(n, n)
 
     return out
+
+
+def _bound(logits):
+    """Squash raw policy logits to ±AI_NET_LOGIT_BOUND (see settings)."""
+    c = S.AI_NET_LOGIT_BOUND
+    return c * torch.tanh(logits / c)
 
 
 # ── Residual block ────────────────────────────────────────────────────────────
@@ -208,8 +215,7 @@ class PyTorchPlayer(BasePlayer):
 
         enc_np = encode_state(board, connections, forbidden, player)
 
-        own_scores, opp_scores = opportunity_masks(board, connections, player)
-        boost_np = boost_log_offsets(own_scores, opp_scores, mask_np)
+        boost_np = guidance_offsets(board, player, scores, forbidden)
 
         with torch.no_grad():
             x    = torch.tensor(enc_np, dtype=torch.float32,
@@ -218,7 +224,8 @@ class PyTorchPlayer(BasePlayer):
                                 device=self._device)
 
             logits, val = self._net(x)
-            logits = logits[0] + torch.tensor(boost_np, device=self._device)
+            logits = (_bound(logits[0])
+                      + torch.tensor(boost_np, device=self._device))
             logits[~mask] = float('-inf')
             log_p  = F.log_softmax(logits, dim=0)
 
@@ -252,6 +259,10 @@ class PyTorchPlayer(BasePlayer):
         else:
             terminal = (1.0  if winner == self.player_id else
                        -1.0  if winner != 0              else 0.0)
+
+        # Safety net: if an update ever produces non-finite parameters,
+        # roll back to this snapshot instead of saving a dead network.
+        backup = {k: v.clone() for k, v in self._net.state_dict().items()}
 
         if self._traj:
             T = len(self._traj)
@@ -318,7 +329,7 @@ class PyTorchPlayer(BasePlayer):
 
                     logits, vals_pred = self._net(b_states)
 
-                    logits = logits + boosts_t[batch]
+                    logits = _bound(logits) + boosts_t[batch]
                     # Use a large finite negative instead of -inf so that
                     # autograd can backprop cleanly.  -inf produces
                     # 0 * (-inf) = NaN in the entropy term and NaN gradients
@@ -422,7 +433,7 @@ class PyTorchPlayer(BasePlayer):
                     b_ret     = obs_ret_t[batch]
 
                     logits, vals_pred = self._net(b_states)
-                    logits = logits + obs_boosts_t[batch]
+                    logits = _bound(logits) + obs_boosts_t[batch]
                     # Same finite-masking fix as the own-move PPO loop above:
                     # use -1e9 instead of -inf to keep autograd gradients finite.
                     logits = logits.masked_fill(~b_masks, -1e9)
@@ -452,6 +463,10 @@ class PyTorchPlayer(BasePlayer):
                     self._opt.step()
 
             self._obs_traj.clear()
+
+        if not all(torch.isfinite(q).all() for q in self._net.parameters()):
+            self._net.load_state_dict(backup)
+            self._opt.state.clear()        # Adam moments are poisoned too
 
         self.save()
 
@@ -484,14 +499,15 @@ class PyTorchPlayer(BasePlayer):
                 if (bx, by) not in occupied and (bx, by) not in forbidden:
                     mask_np[by * n + bx] = True
 
-        if not mask_np.any():
+        action = gy * n + gx
+        if not mask_np[action]:
+            # Illegal move (e.g. corrupt replay data).  Its log-prob would be
+            # -inf and the PPO ratio would turn every parameter into NaN.
             return
 
         enc = encode_state(board, connections, forbidden, player_who_moved)
-        action = gy * n + gx
-        own_scores, opp_scores = opportunity_masks(
-            board, connections, player_who_moved)
-        boost_np = boost_log_offsets(own_scores, opp_scores, mask_np)
+        boost_np = guidance_offsets(board, player_who_moved, None, forbidden,
+                                    fast=True)
 
         with torch.no_grad():
             x      = torch.tensor(enc, dtype=torch.float32,
@@ -499,7 +515,8 @@ class PyTorchPlayer(BasePlayer):
             mask_t = torch.tensor(mask_np, dtype=torch.bool,
                                   device=self._device)
             logits, val = self._net(x)
-            logits = logits[0] + torch.tensor(boost_np, device=self._device)
+            logits = (_bound(logits[0])
+                      + torch.tensor(boost_np, device=self._device))
             logits[~mask_t] = float('-inf')
             log_p  = F.log_softmax(logits, dim=0)
             log_prob_old = float(log_p[action].item())
@@ -530,7 +547,9 @@ class PyTorchPlayer(BasePlayer):
                             weights_only=False)
             if (ck.get('grid') == S.GRID
                     and ck.get('arch') == self._arch
-                    and ck.get('enc_version', 1) == 2):
+                    and ck.get('enc_version', 1) == 2
+                    and all(torch.isfinite(t).all()
+                            for t in ck['model'].values())):
                 self._net.load_state_dict(ck['model'])
                 self._opt.load_state_dict(ck['optim'])
         except Exception:
