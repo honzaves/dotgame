@@ -207,3 +207,12 @@ marimo/_lsp/
 __marimo__/
 
 .idea/
+
+# AI data written by the game (per grid size)
+ai_experience_*.json
+nn_weights_*.npz
+pt_weights_*.pt
+nm_weights_*.pt
+replay_buffer_*.json
+
+.DS_Store
